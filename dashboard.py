@@ -1946,15 +1946,21 @@ def render_pnl_journal(df=None, fx=None):
         snap['daily_pnl_pct'] = (snap['daily_pnl'] / snap['prev_nav'] * 100)
         # Gap days between consecutive snapshots
         snap['gap_days'] = (snap['date_dt'] - snap['date_dt'].shift(1)).dt.days
+        # Trading date = snapshot date − 1 (6 AM snapshot captures yesterday's close)
+        snap['trading_date_dt'] = snap['date_dt'] - pd.Timedelta(days=1)
+        snap['trading_date'] = snap['trading_date_dt'].dt.strftime('%Y-%m-%d')
         snap = snap.dropna(subset=['daily_pnl'])
+        # Drop rows where trading date falls on a weekend (no real trading)
+        snap = snap[snap['trading_date_dt'].dt.dayofweek < 5]
 
         if snap.empty and _rt_daily_pnl is None:
             return
 
-        # Build lookup: date_str → {pnl, pnl_pct, nav, capital, net_pnl, gap_days}
+        # Build lookup: trading_date_str → {pnl, pnl_pct, nav, capital, net_pnl, gap_days}
+        # Uses trading_date (= snapshot date − 1 day), already computed & weekend-filtered above.
         pnl_lookup = {}
         for _, r in snap.iterrows():
-            pnl_lookup[r['date']] = {
+            pnl_lookup[r['trading_date']] = {
                 'pnl': r['daily_pnl'],
                 'pnl_pct': r['daily_pnl_pct'],
                 'nav': r['net_assets'],
@@ -1964,9 +1970,12 @@ def render_pnl_journal(df=None, fx=None):
             }
 
     # Override today's entry with real-time position-based daily P&L
-    # Skip weekends — markets closed, data is stale replay of Friday
-    _is_sunday = pd.Timestamp.now().dayofweek == 6
-    if _rt_daily_pnl is not None and not _is_sunday:
+    # Weekdays: today's P&L reflects live trading → label as today
+    # Saturday: real-time P&L = Friday's close vs Thursday's close = Friday's P&L;
+    #           historical shift already covers Friday → skip to avoid duplicate
+    # Sunday: no trading → skip
+    _dow = pd.Timestamp.now().dayofweek
+    if _rt_daily_pnl is not None and _dow < 5:  # Mon–Fri only
         _today_nav = pnl_lookup.get(_today_str, {}).get('nav')
         _today_cap = _cap_lookup.get(_today_str)
         if _today_nav is None and not snap_df.empty:
@@ -2096,10 +2105,9 @@ def render_pnl_journal(df=None, fx=None):
     # ── Journal table (expandable) — last 30 days only ──
     if not snap.empty:
         _30d_ago = (pd.Timestamp.now() - pd.Timedelta(days=30)).strftime('%Y-%m-%d')
-        journal = snap[snap['date'] >= _30d_ago].sort_values('date', ascending=False).copy()
+        journal = snap[snap['trading_date'] >= _30d_ago].sort_values('trading_date', ascending=False).copy()
         if journal.empty:
             return
-        journal['date_dt'] = pd.to_datetime(journal['date'])
         with st.expander(f"Net P&L Journal (last 30 days · {len(journal)} entries)", expanded=False):
 
             jhtml = '<table class="cash-table"><thead><tr>'
@@ -2109,14 +2117,9 @@ def render_pnl_journal(df=None, fx=None):
             jhtml += '</tr></thead><tbody>'
 
             for _, r in journal.iterrows():
-                _d = r['date']
-                # Override today's row with real-time position-based P&L
-                if _d == _today_str and _rt_daily_pnl is not None:
-                    pnl = _rt_daily_pnl
-                    pct = _rt_daily_pnl_pct or 0
-                else:
-                    pnl = r['daily_pnl']
-                    pct = r['daily_pnl_pct']
+                _d = r['trading_date']
+                pnl = r['daily_pnl']
+                pct = r['daily_pnl_pct']
                 cls = _pnl_class(pnl)
                 sign = '+' if pnl >= 0 else ''
                 _cap = r.get('capital')
