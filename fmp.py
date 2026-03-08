@@ -87,6 +87,27 @@ def _cache_result(ticker, sector, industry, db_path=None):
 
 # ── API fetch ─────────────────────────────────────────────
 
+def _yfinance_fallback(ticker):
+    """Free fallback: fetch (sector, industry) via yfinance.
+
+    Works for US stocks, HK (.HK), Japan (.T).
+    Chinese A-shares (.SS/.SZ), funds, B-shares are covered by
+    _MANUAL_INDUSTRY and should never reach this function.
+    """
+    try:
+        import yfinance as yf
+        info = yf.Ticker(ticker).info
+        sector = info.get('sector', '') or ''
+        industry = info.get('industry', '') or ''
+        if sector in ('', 'N/A'):
+            sector = ''
+        if industry in ('', 'N/A'):
+            industry = ''
+        return sector, industry
+    except Exception:
+        return '', ''
+
+
 def _to_fmp_ticker(ticker):
     """Convert Yahoo Finance ticker format to FMP format if needed."""
     if not ticker:
@@ -118,33 +139,39 @@ def fetch_profile(ticker, db_path=None):
         _cache_result(ticker, sector, industry, db_path)
         return sector, industry
 
-    if not FMP_API_KEY:
-        return '', ''
+    # Try FMP API if key is available
+    if FMP_API_KEY:
+        fmp_ticker = _to_fmp_ticker(ticker)
+        try:
+            resp = requests.get(
+                f"{FMP_BASE}/profile/{fmp_ticker}",
+                params={"apikey": FMP_API_KEY},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if data and isinstance(data, list) and len(data) > 0:
+                profile = data[0]
+                is_etf = profile.get('isEtf', False)
+                sector = profile.get('sector', '') or ''
+                industry = profile.get('industry', '') or ''
+                # Override ETFs: FMP returns "Asset Management" for the fund manager,
+                # but we want to classify the ETF by what it tracks
+                if is_etf or industry == 'Asset Management':
+                    company_name = profile.get('companyName', '') or ''
+                    sector = 'ETF'
+                    industry = company_name if company_name else 'ETF'
+                if sector or industry:
+                    _cache_result(ticker, sector, industry, db_path)
+                    return sector, industry
+        except Exception as e:
+            print(f"  FMP profile fetch failed for {fmp_ticker}: {e}", file=sys.stderr)
 
-    fmp_ticker = _to_fmp_ticker(ticker)
-    try:
-        resp = requests.get(
-            f"{FMP_BASE}/profile/{fmp_ticker}",
-            params={"apikey": FMP_API_KEY},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        if data and isinstance(data, list) and len(data) > 0:
-            profile = data[0]
-            is_etf = profile.get('isEtf', False)
-            sector = profile.get('sector', '') or ''
-            industry = profile.get('industry', '') or ''
-            # Override ETFs: FMP returns "Asset Management" for the fund manager,
-            # but we want to classify the ETF by what it tracks
-            if is_etf or industry == 'Asset Management':
-                company_name = profile.get('companyName', '') or ''
-                sector = 'ETF'
-                industry = company_name if company_name else 'ETF'
-            _cache_result(ticker, sector, industry, db_path)
-            return sector, industry
-    except Exception as e:
-        print(f"  FMP profile fetch failed for {fmp_ticker}: {e}", file=sys.stderr)
+    # Free fallback: yfinance (works for US, HK, JP stocks — no API key needed)
+    sector, industry = _yfinance_fallback(ticker)
+    if sector or industry:
+        _cache_result(ticker, sector, industry, db_path)
+        return sector, industry
 
     # Cache empty result to avoid repeated failures
     _cache_result(ticker, '', '', db_path)

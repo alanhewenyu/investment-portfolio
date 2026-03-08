@@ -12,7 +12,7 @@ import streamlit as st
 from db import (DB_PATH, get_conn, init_db, upsert_position, upsert_snapshot,
                 upsert_cash, upsert_margin, insert_closed_trade,
                 compute_capital, FUTU_CAPITAL, FUTU_DEPOSIT_FX, B_SHARE_CAPITAL,
-                get_ytd_baselines, record_ytd_baselines)
+                DEPOSIT_MODE, get_ytd_baselines, record_ytd_baselines)
 from prices import fetch_price, get_fx_rates, prefetch_all, get_previous_close
 from fmp import fetch_all_industries
 
@@ -2229,7 +2229,7 @@ def render_closed(fx=None):
 def render_sidebar():
     st.markdown("### Position Management")
 
-    tab1, tab2, tab3 = st.tabs(["Edit", "Delete", "Cash/Margin"])
+    tab1, tab2, tab3, tab4 = st.tabs(["Edit", "Delete", "Cash/Margin", "Import"])
 
     with tab1:
         positions_df = load_positions()
@@ -2520,6 +2520,136 @@ def render_sidebar():
                 else:
                     st.info("No changes detected")
 
+    # ── Import tab ──
+    with tab4:
+        st.markdown("**Bulk Import via CSV**")
+        st.caption("Upload CSV files to bulk-import positions, cash, or closed trades. "
+                   "Existing records with the same key will be updated.")
+
+        # ── Template downloads ──
+        with st.expander("📥 Download CSV Templates"):
+            _pos_tpl = ("ticker,name,market,broker,currency,quantity,cost_price\n"
+                        "AAPL,Apple,美股,MyBroker,USD,100,150.00\n"
+                        "0700.HK,Tencent,港股,MyBroker,HKD,200,350.00\n")
+            st.download_button("Positions Template", _pos_tpl,
+                               "positions_template.csv", "text/csv",
+                               key="dl_pos_tpl")
+
+            _cash_tpl = ("account,currency,balance\n"
+                         "MyBroker,USD,10000\n"
+                         "MyBroker,CNY,50000\n")
+            st.download_button("Cash Template", _cash_tpl,
+                               "cash_template.csv", "text/csv",
+                               key="dl_cash_tpl")
+
+            _closed_tpl = ("ticker,name,market,broker,currency,realized_pnl,close_date\n"
+                           "MSFT,Microsoft,美股,MyBroker,USD,500.00,2026-01-15\n")
+            st.download_button("Closed Trades Template", _closed_tpl,
+                               "closed_trades_template.csv", "text/csv",
+                               key="dl_closed_tpl")
+
+        # ── Positions import ──
+        st.markdown("**Import Positions**")
+        pos_file = st.file_uploader("Upload positions CSV", type=['csv'],
+                                    key='import_pos_file')
+        if pos_file is not None:
+            try:
+                pos_imp = pd.read_csv(pos_file)
+                required = {'ticker', 'name', 'market', 'broker', 'currency',
+                            'quantity', 'cost_price'}
+                missing = required - set(pos_imp.columns)
+                if missing:
+                    st.error(f"Missing columns: {', '.join(sorted(missing))}")
+                else:
+                    st.dataframe(pos_imp, use_container_width=True, hide_index=True)
+                    st.caption(f"{len(pos_imp)} rows ready. Review above, then click Import.")
+                    if st.button("Import Positions", type="primary",
+                                 key="btn_import_pos"):
+                        with get_conn() as conn:
+                            for _, r in pos_imp.iterrows():
+                                upsert_position(conn, str(r['ticker']).strip(),
+                                                str(r['name']).strip(),
+                                                str(r['market']).strip(),
+                                                str(r['broker']).strip(),
+                                                str(r['currency']).strip().upper(),
+                                                float(r['quantity']),
+                                                float(r['cost_price']))
+                            conn.commit()
+                        st.success(f"Imported {len(pos_imp)} positions ✓")
+                        load_positions.clear()
+                        build_portfolio.clear()
+                        st.rerun()
+            except Exception as e:
+                st.error(f"CSV parse error: {e}")
+
+        # ── Cash import ──
+        st.markdown("**Import Cash Balances**")
+        cash_file = st.file_uploader("Upload cash CSV", type=['csv'],
+                                     key='import_cash_file')
+        if cash_file is not None:
+            try:
+                cash_imp = pd.read_csv(cash_file)
+                required = {'account', 'currency', 'balance'}
+                missing = required - set(cash_imp.columns)
+                if missing:
+                    st.error(f"Missing columns: {', '.join(sorted(missing))}")
+                else:
+                    st.dataframe(cash_imp, use_container_width=True, hide_index=True)
+                    if st.button("Import Cash", type="primary",
+                                 key="btn_import_cash"):
+                        with get_conn() as conn:
+                            for _, r in cash_imp.iterrows():
+                                upsert_cash(conn, str(r['account']).strip(),
+                                            str(r['currency']).strip().upper(),
+                                            float(r['balance']))
+                            conn.commit()
+                        st.success(f"Imported {len(cash_imp)} cash balances ✓")
+                        load_cash.clear()
+                        st.rerun()
+            except Exception as e:
+                st.error(f"CSV parse error: {e}")
+
+        # ── Closed trades import ──
+        st.markdown("**Import Closed Trades**")
+        closed_file = st.file_uploader("Upload closed trades CSV", type=['csv'],
+                                       key='import_closed_file')
+        if closed_file is not None:
+            try:
+                closed_imp = pd.read_csv(closed_file)
+                required = {'ticker', 'name', 'market', 'broker', 'currency',
+                            'realized_pnl'}
+                missing = required - set(closed_imp.columns)
+                if missing:
+                    st.error(f"Missing columns: {', '.join(sorted(missing))}")
+                else:
+                    st.dataframe(closed_imp, use_container_width=True, hide_index=True)
+                    if st.button("Import Closed Trades", type="primary",
+                                 key="btn_import_closed"):
+                        fx = get_fx_rates()
+                        with get_conn() as conn:
+                            for _, r in closed_imp.iterrows():
+                                cur = str(r['currency']).strip().upper()
+                                rpl = float(r['realized_pnl'])
+                                rpl_cny = rpl * fx.get(cur, 1.0)
+                                insert_closed_trade(
+                                    conn,
+                                    ticker=str(r['ticker']).strip(),
+                                    name=str(r['name']).strip(),
+                                    market=str(r['market']).strip(),
+                                    broker=str(r['broker']).strip(),
+                                    currency=cur,
+                                    realized_pnl=rpl,
+                                    realized_pnl_cny=rpl_cny,
+                                    close_date=(str(r['close_date'])
+                                                if 'close_date' in r and pd.notna(r.get('close_date'))
+                                                else None),
+                                )
+                            conn.commit()
+                        st.success(f"Imported {len(closed_imp)} closed trades ✓")
+                        load_closed.clear()
+                        st.rerun()
+            except Exception as e:
+                st.error(f"CSV parse error: {e}")
 
 
 # ────────────────────────────────────────
@@ -2593,15 +2723,22 @@ def main():
 
     # Capital calculation notes
     _cap_ts = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')
-    st.markdown(f'''<div style="font-size:11px; color:var(--pf-text2); font-family:var(--pf-mono);
-        margin-top:-8px; margin-bottom:16px; line-height:1.6;">
-        Capital = 富途入金(¥{_fmt(FUTU_CAPITAL)}) + B股入金(¥{_fmt(B_SHARE_CAPITAL)})
-        + 非富途非B股持仓成本 + 现金 − 场外杠杆 − 已平仓盈亏 = <b>¥{_fmt(current_capital)}</b>
-        <span style="opacity:0.5;">({_cap_ts})</span><br>
-        <span style="opacity:0.7;">* 富途入金 hardcode: 该账户入金只进不出，使用历史人民币入金总额，避免汇率折算<br>
-        * B股入金 hardcode: 同理，使用历史入金总额<br>
-        * 已平仓盈亏: A股 + 基金 + 港股(招商) 已平仓损益，按卖出时汇率折算为¥，不再二次折算</span>
-    </div>''', unsafe_allow_html=True)
+    if DEPOSIT_MODE:
+        st.markdown(f'''<div style="font-size:11px; color:var(--pf-text2); font-family:var(--pf-mono);
+            margin-top:-8px; margin-bottom:16px; line-height:1.6;">
+            Capital = 富途入金(¥{_fmt(FUTU_CAPITAL)}) + B股入金(¥{_fmt(B_SHARE_CAPITAL)})
+            + 非富途非B股持仓成本 + 现金 − 场外杠杆 − 已平仓盈亏 = <b>¥{_fmt(current_capital)}</b>
+            <span style="opacity:0.5;">({_cap_ts})</span><br>
+            <span style="opacity:0.7;">* 富途入金 hardcode: 该账户入金只进不出，使用历史人民币入金总额，避免汇率折算<br>
+            * B股入金 hardcode: 同理，使用历史入金总额<br>
+            * 已平仓盈亏: A股 + 基金 + 港股(招商) 已平仓损益，按卖出时汇率折算为¥，不再二次折算</span>
+        </div>''', unsafe_allow_html=True)
+    else:
+        st.markdown(f'''<div style="font-size:11px; color:var(--pf-text2); font-family:var(--pf-mono);
+            margin-top:-8px; margin-bottom:16px; line-height:1.6;">
+            Capital = 持仓成本 + 现金 − 场外杠杆 − 已平仓盈亏 = <b>¥{_fmt(current_capital)}</b>
+            <span style="opacity:0.5;">({_cap_ts})</span>
+        </div>''', unsafe_allow_html=True)
 
     # ── P&L breakdown ──
     _equity_mv = df['market_value_cny'].sum() if not df.empty else 0
@@ -2619,37 +2756,44 @@ def main():
     _tp_cls = _pnl_class(_total_pl)
     _fx_cls = _pnl_class(_forex_gl)
 
-    # ── 富途 account-level breakdown ──
-    # build_portfolio() now uses the same fx as main(), so df values are consistent.
-    # 1) FX impact on deposit: deposited RMB converted at avg FUTU_DEPOSIT_FX, now at current rate
-    _futu_fx_impact = FUTU_CAPITAL / FUTU_DEPOSIT_FX * fx.get('USD', 1.0) - FUTU_CAPITAL
-    _futu_fx_cls = _pnl_class(_futu_fx_impact)
-    # 2) Margin interest & fees: 富途 net_assets − capital − unrealised − realised − fx_impact
-    _futu_mv = df.loc[df['broker'] == '富途', 'market_value_cny'].sum() if not df.empty else 0
-    _futu_margin = sum(r['amount'] * fx.get(r['currency'], 1.0)
-                       for _, r in margin_df.iterrows() if r['category'] == 'in_house')
-    _futu_na = _futu_mv - _futu_margin
-    _futu_ur = df.loc[df['broker'] == '富途', 'pnl_cny'].sum() if not df.empty else 0
-    _futu_rp = (_closed_df.loc[_closed_df['broker'] == '富途', 'realized_pnl_cny'].sum()
-                if not _closed_df.empty else 0)
-    _futu_residual = _futu_na - FUTU_CAPITAL - _futu_ur - _futu_rp
-    _futu_int_fees = _futu_residual - _futu_fx_impact
-    _futu_if_cls = _pnl_class(_futu_int_fees)
+    if DEPOSIT_MODE:
+        # ── 富途 account-level breakdown (deposit mode only) ──
+        _futu_fx_impact = FUTU_CAPITAL / FUTU_DEPOSIT_FX * fx.get('USD', 1.0) - FUTU_CAPITAL
+        _futu_fx_cls = _pnl_class(_futu_fx_impact)
+        _futu_mv = df.loc[df['broker'] == '富途', 'market_value_cny'].sum() if not df.empty else 0
+        _futu_margin = sum(r['amount'] * fx.get(r['currency'], 1.0)
+                           for _, r in margin_df.iterrows() if r['category'] == 'in_house')
+        _futu_na = _futu_mv - _futu_margin
+        _futu_ur = df.loc[df['broker'] == '富途', 'pnl_cny'].sum() if not df.empty else 0
+        _futu_rp = (_closed_df.loc[_closed_df['broker'] == '富途', 'realized_pnl_cny'].sum()
+                    if not _closed_df.empty else 0)
+        _futu_residual = _futu_na - FUTU_CAPITAL - _futu_ur - _futu_rp
+        _futu_int_fees = _futu_residual - _futu_fx_impact
+        _futu_if_cls = _pnl_class(_futu_int_fees)
 
-    st.markdown(f'''<div style="font-size:11px; color:var(--pf-text2); font-family:var(--pf-mono);
-        margin-top:-8px; margin-bottom:16px; line-height:1.6;">
-        Net P&L = Net Assets(¥{_fmt(_net_assets)}) − Capital(¥{_fmt(current_capital)})
-        = <b class="{_tp_cls}">¥{_pnl_sign(_total_pl)}</b><br>
-        Diff = Net P&L({_pnl_sign(_total_pl)})
-        − Unrealized({_pnl_sign(_unrealized_pnl)})
-        − Realized({_pnl_sign(_realized_pnl)})
-        = <b class="{_fx_cls}">¥{_pnl_sign(_forex_gl)}</b><br>
-        <span style="opacity:0.5;">* 其中 富途入金汇率影响:
-        <b class="{_futu_fx_cls}">{_pnl_sign(_futu_fx_impact)}</b>
-        (deposit@{FUTU_DEPOSIT_FX}→{fx.get("USD",0):.4f})<br>
-        * 其中 富途融资利息及交易费:
-        <b class="{_futu_if_cls}">{_pnl_sign(_futu_int_fees)}</b></span>
-    </div>''', unsafe_allow_html=True)
+        st.markdown(f'''<div style="font-size:11px; color:var(--pf-text2); font-family:var(--pf-mono);
+            margin-top:-8px; margin-bottom:16px; line-height:1.6;">
+            Net P&L = Net Assets(¥{_fmt(_net_assets)}) − Capital(¥{_fmt(current_capital)})
+            = <b class="{_tp_cls}">¥{_pnl_sign(_total_pl)}</b><br>
+            Diff = Net P&L({_pnl_sign(_total_pl)})
+            − Unrealized({_pnl_sign(_unrealized_pnl)})
+            − Realized({_pnl_sign(_realized_pnl)})
+            = <b class="{_fx_cls}">¥{_pnl_sign(_forex_gl)}</b><br>
+            <span style="opacity:0.5;">* 其中 富途入金汇率影响:
+            <b class="{_futu_fx_cls}">{_pnl_sign(_futu_fx_impact)}</b>
+            (deposit@{FUTU_DEPOSIT_FX}→{fx.get("USD",0):.4f})<br>
+            * 其中 富途融资利息及交易费:
+            <b class="{_futu_if_cls}">{_pnl_sign(_futu_int_fees)}</b></span>
+        </div>''', unsafe_allow_html=True)
+    else:
+        # ── Simplified P&L breakdown (cost mode) ──
+        st.markdown(f'''<div style="font-size:11px; color:var(--pf-text2); font-family:var(--pf-mono);
+            margin-top:-8px; margin-bottom:16px; line-height:1.6;">
+            Net P&L = Net Assets(¥{_fmt(_net_assets)}) − Capital(¥{_fmt(current_capital)})
+            = <b class="{_tp_cls}">¥{_pnl_sign(_total_pl)}</b><br>
+            Unrealized: {_pnl_sign(_unrealized_pnl)} · Realized: {_pnl_sign(_realized_pnl)}
+            · FX & Other: <b class="{_fx_cls}">{_pnl_sign(_forex_gl)}</b>
+        </div>''', unsafe_allow_html=True)
 
     render_attribution(df, fx)
     render_pnl_journal(df, fx)

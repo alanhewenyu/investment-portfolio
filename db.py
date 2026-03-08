@@ -303,25 +303,30 @@ FUTU_CAPITAL    = float(os.environ.get('FUTU_CAPITAL', '0'))       # 富途历�
 FUTU_DEPOSIT_FX = float(os.environ.get('FUTU_DEPOSIT_FX', '1.0')) # 富途入金平均换汇汇率 USD/CNY
 B_SHARE_CAPITAL = float(os.environ.get('B_SHARE_CAPITAL', '0'))   # B股历史入金总额
 
+# Auto-detect capital mode:
+#   deposit mode — when FUTU_CAPITAL or B_SHARE_CAPITAL is set (advanced, for specific brokers)
+#   cost mode    — default, capital = sum of all position costs (simple, for new users)
+DEPOSIT_MODE = FUTU_CAPITAL > 0 or B_SHARE_CAPITAL > 0
+
 
 def compute_capital(conn, fx):
     """Compute total invested capital (CNY).
 
-    Capital = 富途入金 + B股入金 + 其他持仓成本 + 现金 − 场外杠杆 − 已平仓盈亏
+    Deposit mode (FUTU_CAPITAL > 0 or B_SHARE_CAPITAL > 0):
+        Capital = 富途入金 + B股入金 + 其他持仓成本 + 现金 − 场外杠杆 − 已平仓盈亏(A股+基金+港股招商)
 
-    其他持仓成本: open positions excluding 富途 and B股 (those are covered by hardcoded deposits).
-    已平仓盈亏:   closed trades from A股 + 基金 + 港股(招商).
-                  realized_pnl 已按卖出时汇率折算为人民币，直接求和，不再二次折算。
-                  Subtracting a loss (negative PL) adds to capital; subtracting a profit reduces it.
+    Cost mode (default for new users):
+        Capital = 全部持仓成本 + 现金 − 场外杠杆 − 全部已平仓盈亏
     """
-    # Position cost: exclude 富途 (covered by FUTU_CAPITAL) and B股 (covered by B_SHARE_CAPITAL)
-    other_cost = 0.0
+    # Position cost
+    position_cost = 0.0
     for row in conn.execute(
             "SELECT broker, market, currency, quantity, cost_price "
             "FROM positions WHERE status='open'"):
-        if row['broker'] != '富途' and row['market'] != 'B股':
-            rate = fx.get(row['currency'], 1.0)
-            other_cost += row['quantity'] * row['cost_price'] * rate
+        if DEPOSIT_MODE and (row['broker'] == '富途' or row['market'] == 'B股'):
+            continue  # covered by FUTU_CAPITAL / B_SHARE_CAPITAL
+        rate = fx.get(row['currency'], 1.0)
+        position_cost += row['quantity'] * row['cost_price'] * rate
 
     # Cash
     cash_cny = 0.0
@@ -334,14 +339,22 @@ def compute_capital(conn, fx):
             "SELECT currency, amount FROM margin_balances WHERE category='off_exchange'"):
         margin_off += row['amount'] * fx.get(row['currency'], 1.0)
 
-    # Realised P&L from A股, 基金, 港股(招商) — use realized_pnl_cny (converted at trade time)
+    # Realised P&L
     realised_pl = 0.0
-    for row in conn.execute(
-            "SELECT COALESCE(realized_pnl_cny, 0) AS realized_pnl_cny FROM closed_trades "
-            "WHERE market IN ('A股', '基金') OR (market = '港股' AND broker = '招商')"):
-        realised_pl += row['realized_pnl_cny']
+    if DEPOSIT_MODE:
+        # Deposit mode: only A股 + 基金 + 港股(招商) — 富途 P&L tracked via fixed deposit
+        for row in conn.execute(
+                "SELECT COALESCE(realized_pnl_cny, 0) AS rpl FROM closed_trades "
+                "WHERE market IN ('A股', '基金') OR (market = '港股' AND broker = '招商')"):
+            realised_pl += row['rpl']
+    else:
+        # Cost mode: ALL closed trades
+        for row in conn.execute(
+                "SELECT COALESCE(realized_pnl_cny, 0) AS rpl FROM closed_trades"):
+            realised_pl += row['rpl']
 
-    return FUTU_CAPITAL + B_SHARE_CAPITAL + other_cost + cash_cny - margin_off - realised_pl
+    base = (FUTU_CAPITAL + B_SHARE_CAPITAL + position_cost) if DEPOSIT_MODE else position_cost
+    return base + cash_cny - margin_off - realised_pl
 
 
 def init_db(db_path=None):
