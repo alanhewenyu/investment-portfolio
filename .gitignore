@@ -21,6 +21,7 @@ venv/
 
 # Environment & config
 .env
+.env.*
 config.yaml
 
 # OS

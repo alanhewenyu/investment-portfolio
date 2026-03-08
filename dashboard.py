@@ -2,6 +2,7 @@
 """Portfolio Dashboard — professional single-page portfolio view."""
 
 import calendar
+import os
 import sqlite3
 import threading
 
@@ -12,17 +13,50 @@ import streamlit as st
 from db import (DB_PATH, get_conn, init_db, upsert_position, upsert_snapshot,
                 upsert_cash, upsert_margin, insert_closed_trade,
                 compute_capital, FUTU_CAPITAL, FUTU_DEPOSIT_FX, B_SHARE_CAPITAL,
-                DEPOSIT_MODE, get_ytd_baselines, record_ytd_baselines)
+                DEPOSIT_MODE, DEPOSIT_BROKERS, get_ytd_baselines, record_ytd_baselines,
+                PORTFOLIOS, set_active_portfolio)
 from prices import fetch_price, get_fx_rates, prefetch_all, get_previous_close
 from fmp import fetch_all_industries
+
+st.set_page_config(page_title="Portfolio Tracker", page_icon="◼", layout="wide")
+
+# ── Multi-portfolio switcher (only visible when PORTFOLIOS env var is set) ──
+if len(PORTFOLIOS) > 1:
+    import db as _db
+    _pf_names = [p[0] for p in PORTFOLIOS]
+    _selected_pf = st.sidebar.selectbox(
+        "Portfolio", _pf_names, key="pf_select",
+        label_visibility="collapsed",
+    )
+    # Clear cached data when portfolio changes (avoids stale cross-portfolio data)
+    if st.session_state.get('_active_pf') != _selected_pf:
+        st.cache_data.clear()
+        st.session_state['_active_pf'] = _selected_pf
+    _pf_dict = dict(PORTFOLIOS)
+    _selected_path = _pf_dict[_selected_pf]
+    # Look up per-portfolio capital config:
+    #   CAPITAL_<name>=deposit_cap,deposit_fx,b_cap[,broker1,broker2,...]
+    # First 3 values are numbers (capital, fx, b-share capital).
+    # Values after position 3 are deposit broker names (optional).
+    # If no brokers specified, defaults to {'富途'} when deposit mode is active.
+    _cap_raw = os.environ.get(f'CAPITAL_{_selected_pf}', '').strip()
+    if _cap_raw:
+        _parts = [x.strip() for x in _cap_raw.split(',')]
+        _nums = [float(p) for p in _parts[:3]]
+        _brokers = {p for p in _parts[3:] if p}  # broker names after the 3 numbers
+        set_active_portfolio(_selected_path, *_nums,
+                             deposit_brokers=_brokers if _brokers else None)
+    else:
+        set_active_portfolio(_selected_path)  # cost mode (all zeros)
+    # Re-import updated globals (set_active_portfolio rebinds module-level names)
+    from db import (FUTU_CAPITAL, FUTU_DEPOSIT_FX, B_SHARE_CAPITAL,  # noqa: F811
+                    DEPOSIT_MODE, DEPOSIT_BROKERS)  # noqa: F811
 
 init_db()  # ensure migrations (e.g. created_at) are applied
 
 # ── YTD baseline prices are stored in DB table `ytd_baseline_prices` ──
 # 2026 seed: 3/6 (Fri) closing prices (migrated from hardcoded dict).
 # Future years: auto-recorded on first snapshot of new year via prev_close.
-
-st.set_page_config(page_title="Portfolio Tracker", page_icon="◼", layout="wide")
 
 # ────────────────────────────────────────
 # CSS
@@ -147,10 +181,14 @@ section.main > div.block-container {
     padding-left: 2.5rem !important; padding-right: 2.5rem !important;
     max-width: 100% !important;
 }
-/* Sidebar */
+/* Sidebar — reduce default top padding */
 [data-testid="stSidebar"] [data-testid="stSidebarContent"] {
     width: 100%; font-family: var(--pf-mono);
+    padding-top: 8px !important;
 }
+[data-testid="stSidebarHeader"] { padding-top: 4px !important; height: auto !important; }
+[data-testid="stLogoSpacer"] { display: none !important; }
+[data-testid="stSidebarUserContent"] { padding-top: 4px !important; margin-top: 0 !important; }
 
 
 /* Hide +/- step buttons on sidebar number inputs (direct typing is faster for amounts) */
@@ -218,7 +256,7 @@ if 'prefetched' not in st.session_state:
 
 
 def _query(sql, params=()):
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_conn() as conn:
         return pd.read_sql_query(sql, conn, params=params)
 
 
@@ -359,13 +397,15 @@ def build_portfolio(fx_tuple=None):
         prev_close = get_previous_close(ticker)
         if prev_close and prev_close > 0 and not stale_flags[-1]:
             baseline = prev_close
-            # If position was CREATED today, user just opened it;
+            # If position was CREATED today on a trading day, user just opened it;
             # price movement before entry is irrelevant → use cost_price.
+            # Only apply on weekdays — weekend imports shouldn't override.
             # Note: uses created_at (immutable), NOT updated_at (changes on edit).
+            _now = pd.Timestamp.now()
             crt = row.get('created_at')
-            if crt:
+            if crt and _now.weekday() < 5:  # Mon(0)–Fri(4) only
                 try:
-                    if pd.to_datetime(crt).date() == pd.Timestamp.now().date():
+                    if pd.to_datetime(crt).date() == _now.date():
                         baseline = cost
                 except Exception:
                     pass
@@ -575,21 +615,14 @@ def render_kpi(df, cash_df, fx, current_capital=None):
             except Exception:
                 _md_dates = set()
 
-            # Strategy: find snapshot with market detail closest to 7 days ago
-            _old_snaps = _past[_past['date'] <= _week_ago]
-            if not _old_snaps.empty:
-                for _i in range(len(_old_snaps)):
-                    _d = _old_snaps.iloc[_i]['date']
-                    if _d in _md_dates:
-                        _wk_base_date = _d
-                        break
-            # Fallback: oldest past snapshot with market detail
-            if _wk_base_date is None:
-                for _i in range(len(_past) - 1, -1, -1):
-                    _d = _past.iloc[_i]['date']
-                    if _d in _md_dates:
-                        _wk_base_date = _d
-                        break
+            # Find most recent snapshot (before today) that has market detail
+            # Note: _past is sorted DESC (newest first from load_snapshots)
+            _yesterday_str = (pd.Timestamp.now() - pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+            for _i in range(len(_past)):  # index 0 = newest
+                _d = _past.iloc[_i]['date']
+                if _d <= _yesterday_str and _d in _md_dates:
+                    _wk_base_date = _d
+                    break
             if _wk_base_date and _market_mv:
                 # Convert snapshot to CNY at current FX (FX-neutral comparison)
                 _base_mv = _resolve_snapshot_mv(_wk_base_date, fx)
@@ -599,18 +632,24 @@ def render_kpi(df, cash_df, fx, current_capital=None):
                     weekly_pnl = _cur_total - _base_total
                     weekly_pnl_pct = weekly_pnl / _base_total * 100
                     weekly_days = (pd.Timestamp.now() - pd.Timestamp(_wk_base_date)).days
+                    # Discard same-day comparison (meaningless 0 delta)
+                    if weekly_days <= 0:
+                        weekly_pnl = None
+                        weekly_pnl_pct = None
+                        weekly_days = None
 
-    # YTD from snapshot: earliest snapshot with market_detail in current year
-    # (includes today — the 3/7 snapshot records 3/6 closing prices and is valid as baseline)
+    # YTD from snapshot: earliest snapshot with market_detail around year-end / year-start
+    # Include late December of prior year to capture year-end baselines (e.g. 2025-12-31).
     ytd_return = None
     ytd_pnl = None
     _ytd_base_date = None
     _current_year = pd.Timestamp.now().strftime('%Y')
+    _prev_year_end = f'{int(_current_year) - 1}-12-28'
     try:
         with get_conn() as _ytd_conn:
             _ytd_row = _ytd_conn.execute(
                 "SELECT MIN(date) as d FROM snapshot_market_detail WHERE date >= ?",
-                (f'{_current_year}-01-01',)
+                (_prev_year_end,)
             ).fetchone()
             if _ytd_row and _ytd_row['d']:
                 _ytd_base_date = _ytd_row['d']
@@ -715,7 +754,7 @@ def render_kpi(df, cash_df, fx, current_capital=None):
 
     if weekly_pnl is not None:
         wp_cls = _pnl_class(weekly_pnl)
-        wk_label = f'Last 7 Days' if not weekly_days or weekly_days >= 7 else f'Last {weekly_days}d'
+        wk_label = f'Last {weekly_days}d' if weekly_days else 'Last 1d'
         html += f'''<div class="kpi-card">
             <div class="kpi-label">{wk_label}</div>
             <div class="kpi-value {wp_cls}">{_pnl_sign(weekly_pnl)}</div>
@@ -724,11 +763,12 @@ def render_kpi(df, cash_df, fx, current_capital=None):
 
     if ytd_return is not None:
         ytd_cls = _pnl_class(ytd_return)
+        _ytd_label = f'vs. {_ytd_base_date[5:]} Close' if _ytd_base_date else ''
         html += f'''<div class="kpi-card">
             <div class="kpi-label">YTD Return</div>
             <div class="kpi-value {ytd_cls}">{_pnl_sign(ytd_pnl)}</div>
             <div class="kpi-sub {ytd_cls}">{_pnl_sign(ytd_return, 2)}%</div>
-            <div style="font-size:9px;color:var(--pf-text2);opacity:0.6;">vs. 3/6 Close</div>
+            <div style="font-size:9px;color:var(--pf-text2);opacity:0.6;">{_ytd_label}</div>
         </div>'''
 
     html += '</div>'
@@ -783,8 +823,8 @@ def render_kpi(df, cash_df, fx, current_capital=None):
         strip_rows.append(_build_strip('Daily', day_by_mkt, day_base_mkt))
 
     # Weekly per-market — reuse the same base snapshot found for KPI card
-    if _wk_base_date and _market_mv:
-        _wk_label = f'Last 7 Days' if not weekly_days or weekly_days >= 7 else f'Last {weekly_days}d'
+    if _wk_base_date and _market_mv and weekly_pnl is not None:
+        _wk_label = f'Last {weekly_days}d' if weekly_days else 'Last 1d'
         strip_rows.append(_snap_strip(_wk_label, _market_mv, _wk_base_date))
     elif not _wk_base_date and day_by_mkt:
         strip_rows.append(_build_strip('Last 1d', day_by_mkt, day_base_mkt))
@@ -2895,8 +2935,8 @@ def render_sidebar():
 
 def main():
     # Build portfolio data first (cached)
-    fx = get_fx_rates()
     with st.spinner("正在加载行情数据..."):
+        fx = get_fx_rates()
         df = build_portfolio(fx_tuple=tuple(sorted(fx.items())))
     cash_df = load_cash()
 
@@ -2961,15 +3001,23 @@ def main():
     # Capital calculation notes
     _cap_ts = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')
     if DEPOSIT_MODE:
-        st.markdown(f'''<div style="font-size:11px; color:var(--pf-text2); font-family:var(--pf-mono);
-            margin-top:-8px; margin-bottom:16px; line-height:1.6;">
-            Capital = 富途入金(¥{_fmt(FUTU_CAPITAL)}) + B股入金(¥{_fmt(B_SHARE_CAPITAL)})
-            + 非富途非B股持仓成本 + 现金 − 场外杠杆 − 已平仓盈亏 = <b>¥{_fmt(current_capital)}</b>
-            <span style="opacity:0.5;">({_cap_ts})</span><br>
-            <span style="opacity:0.7;">* 富途入金 hardcode: 该账户入金只进不出，使用历史人民币入金总额，避免汇率折算<br>
-            * B股入金 hardcode: 同理，使用历史入金总额<br>
-            * 已平仓盈亏: A股 + 基金 + 港股(招商) 已平仓损益，按卖出时汇率折算为¥，不再二次折算</span>
-        </div>''', unsafe_allow_html=True)
+        # Check if there are non-deposit positions (to decide formula display)
+        _has_other = (not df.empty and
+                      df.loc[~df['broker'].isin(DEPOSIT_BROKERS) & (df['market'] != 'B股')].shape[0] > 0)
+        if _has_other:
+            # Complex formula (Individual-style: deposits + other costs + cash − leverage − RPL)
+            _deposit_parts = []
+            if FUTU_CAPITAL > 0:
+                _deposit_parts.append(f'入金(¥{_fmt(FUTU_CAPITAL)})')
+            if B_SHARE_CAPITAL > 0:
+                _deposit_parts.append(f'B股入金(¥{_fmt(B_SHARE_CAPITAL)})')
+            _deposit_str = ' + '.join(_deposit_parts) if _deposit_parts else '入金(¥0)'
+            st.markdown(f'''<div style="font-size:11px; color:var(--pf-text2); font-family:var(--pf-mono);
+                margin-top:-8px; margin-bottom:16px; line-height:1.6;">
+                Capital = {_deposit_str} + 其他持仓成本 + 现金 − 场外杠杆 − 已平仓盈亏 = <b>¥{_fmt(current_capital)}</b>
+                <span style="opacity:0.5;">({_cap_ts})</span>
+            </div>''', unsafe_allow_html=True)
+        # else: deposit-only portfolio — capital is simply the deposit amount, no notes needed
     else:
         st.markdown(f'''<div style="font-size:11px; color:var(--pf-text2); font-family:var(--pf-mono);
             margin-top:-8px; margin-bottom:16px; line-height:1.6;">
@@ -2994,34 +3042,38 @@ def main():
     _fx_cls = _pnl_class(_forex_gl)
 
     if DEPOSIT_MODE:
-        # ── 富途 account-level breakdown (deposit mode only) ──
-        _futu_fx_impact = FUTU_CAPITAL / FUTU_DEPOSIT_FX * fx.get('USD', 1.0) - FUTU_CAPITAL
-        _futu_fx_cls = _pnl_class(_futu_fx_impact)
-        _futu_mv = df.loc[df['broker'] == '富途', 'market_value_cny'].sum() if not df.empty else 0
-        _futu_margin = sum(r['amount'] * fx.get(r['currency'], 1.0)
-                           for _, r in margin_df.iterrows() if r['category'] == 'in_house')
-        _futu_na = _futu_mv - _futu_margin
-        _futu_ur = df.loc[df['broker'] == '富途', 'pnl_cny'].sum() if not df.empty else 0
-        _futu_rp = (_closed_df.loc[_closed_df['broker'] == '富途', 'realized_pnl_cny'].sum()
-                    if not _closed_df.empty else 0)
-        _futu_residual = _futu_na - FUTU_CAPITAL - _futu_ur - _futu_rp
-        _futu_int_fees = _futu_residual - _futu_fx_impact
-        _futu_if_cls = _pnl_class(_futu_int_fees)
-
-        st.markdown(f'''<div style="font-size:11px; color:var(--pf-text2); font-family:var(--pf-mono);
+        _pnl_html = f'''<div style="font-size:11px; color:var(--pf-text2); font-family:var(--pf-mono);
             margin-top:-8px; margin-bottom:16px; line-height:1.6;">
             Net P&L = Net Assets(¥{_fmt(_net_assets)}) − Capital(¥{_fmt(current_capital)})
             = <b class="{_tp_cls}">¥{_pnl_sign(_total_pl)}</b><br>
-            Diff = Net P&L({_pnl_sign(_total_pl)})
+            Forex Gain/Loss = Net P&L({_pnl_sign(_total_pl)})
             − Unrealized({_pnl_sign(_unrealized_pnl)})
             − Realized({_pnl_sign(_realized_pnl)})
-            = <b class="{_fx_cls}">¥{_pnl_sign(_forex_gl)}</b><br>
+            = <b class="{_fx_cls}">¥{_pnl_sign(_forex_gl)}</b>'''
+
+        # ── 富途 account-level breakdown (only when 富途 is a deposit broker) ──
+        if '富途' in DEPOSIT_BROKERS and FUTU_DEPOSIT_FX > 0:
+            _futu_fx_impact = FUTU_CAPITAL / FUTU_DEPOSIT_FX * fx.get('USD', 1.0) - FUTU_CAPITAL
+            _futu_fx_cls = _pnl_class(_futu_fx_impact)
+            _futu_mv = df.loc[df['broker'] == '富途', 'market_value_cny'].sum() if not df.empty else 0
+            _futu_margin = sum(r['amount'] * fx.get(r['currency'], 1.0)
+                               for _, r in margin_df.iterrows() if r['category'] == 'in_house')
+            _futu_na = _futu_mv - _futu_margin
+            _futu_ur = df.loc[df['broker'] == '富途', 'pnl_cny'].sum() if not df.empty else 0
+            _futu_rp = (_closed_df.loc[_closed_df['broker'] == '富途', 'realized_pnl_cny'].sum()
+                        if not _closed_df.empty else 0)
+            _futu_residual = _futu_na - FUTU_CAPITAL - _futu_ur - _futu_rp
+            _futu_int_fees = _futu_residual - _futu_fx_impact
+            _futu_if_cls = _pnl_class(_futu_int_fees)
+            _pnl_html += f'''<br>
             <span style="opacity:0.5;">* 其中 富途入金汇率影响:
             <b class="{_futu_fx_cls}">{_pnl_sign(_futu_fx_impact)}</b>
             (deposit@{FUTU_DEPOSIT_FX}→{fx.get("USD",0):.4f})<br>
             * 其中 富途融资利息及交易费:
-            <b class="{_futu_if_cls}">{_pnl_sign(_futu_int_fees)}</b></span>
-        </div>''', unsafe_allow_html=True)
+            <b class="{_futu_if_cls}">{_pnl_sign(_futu_int_fees)}</b></span>'''
+
+        _pnl_html += '</div>'
+        st.markdown(_pnl_html, unsafe_allow_html=True)
     else:
         # ── Simplified P&L breakdown (cost mode) ──
         st.markdown(f'''<div style="font-size:11px; color:var(--pf-text2); font-family:var(--pf-mono);

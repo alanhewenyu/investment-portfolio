@@ -18,6 +18,54 @@ DB_PATH = os.environ.get(
     os.path.join(os.path.dirname(__file__), 'portfolio.db'),
 )
 
+# ── Multi-portfolio support ──
+# Format: PORTFOLIOS=Name1:file1.db,Name2:file2.db
+# Relative paths are resolved against the project directory.
+# When not set (or single entry), the sidebar switcher is hidden.
+_PROJECT_DIR = os.path.dirname(__file__)
+
+def _parse_portfolios() -> list[tuple[str, str]]:
+    """Parse PORTFOLIOS env var into [(name, abs_path), ...]."""
+    raw = os.environ.get('PORTFOLIOS', '').strip()
+    if not raw:
+        return []
+    result = []
+    for item in raw.split(','):
+        item = item.strip()
+        if ':' not in item:
+            continue
+        name, path = item.split(':', 1)
+        name, path = name.strip(), path.strip()
+        if not os.path.isabs(path):
+            path = os.path.join(_PROJECT_DIR, path)
+        result.append((name, path))
+    return result
+
+PORTFOLIOS = _parse_portfolios()
+
+
+def set_active_portfolio(db_path: str, capital: float = 0,
+                         deposit_fx: float = 1.0, b_capital: float = 0,
+                         deposit_brokers: set[str] | None = None):
+    """Switch the active database and capital configuration.
+
+    deposit_brokers: set of broker names whose positions/P&L are covered by
+                     deposit capital (skipped in cost calculation).
+                     Defaults to {'富途'} when deposit mode is active.
+    """
+    global DB_PATH, FUTU_CAPITAL, FUTU_DEPOSIT_FX, B_SHARE_CAPITAL, DEPOSIT_MODE, DEPOSIT_BROKERS
+    DB_PATH = db_path
+    FUTU_CAPITAL = capital
+    FUTU_DEPOSIT_FX = deposit_fx
+    B_SHARE_CAPITAL = b_capital
+    DEPOSIT_MODE = FUTU_CAPITAL > 0 or B_SHARE_CAPITAL > 0
+    if deposit_brokers is not None:
+        DEPOSIT_BROKERS = deposit_brokers
+    elif DEPOSIT_MODE:
+        DEPOSIT_BROKERS = {'富途'}  # backward-compatible default
+    else:
+        DEPOSIT_BROKERS = set()
+
 SCHEMA = """
 PRAGMA journal_mode = WAL;
 
@@ -302,21 +350,24 @@ def _migrate_backfill_market_detail(conn):
 
 
 # ── Capital constants (from environment, see .env.example) ──
-FUTU_CAPITAL    = float(os.environ.get('FUTU_CAPITAL', '0'))       # 富途历史人民币入金总额
-FUTU_DEPOSIT_FX = float(os.environ.get('FUTU_DEPOSIT_FX', '1.0')) # 富途入金平均换汇汇率 USD/CNY
-B_SHARE_CAPITAL = float(os.environ.get('B_SHARE_CAPITAL', '0'))   # B股历史入金总额
+FUTU_CAPITAL    = float(os.environ.get('FUTU_CAPITAL', '0'))       # 入金总额（人民币）
+FUTU_DEPOSIT_FX = float(os.environ.get('FUTU_DEPOSIT_FX', '1.0')) # 入金平均换汇汇率 USD/CNY
+B_SHARE_CAPITAL = float(os.environ.get('B_SHARE_CAPITAL', '0'))   # B股入金总额（人民币）
 
 # Auto-detect capital mode:
 #   deposit mode — when FUTU_CAPITAL or B_SHARE_CAPITAL is set (advanced, for specific brokers)
 #   cost mode    — default, capital = sum of all position costs (simple, for new users)
 DEPOSIT_MODE = FUTU_CAPITAL > 0 or B_SHARE_CAPITAL > 0
 
+# Brokers whose positions & P&L are covered by deposit capital (skip in cost calc)
+DEPOSIT_BROKERS: set[str] = {'富途'}
+
 
 def compute_capital(conn: sqlite3.Connection, fx: dict[str, float]) -> float:
     """Compute total invested capital (CNY).
 
-    Deposit mode (FUTU_CAPITAL > 0 or B_SHARE_CAPITAL > 0):
-        Capital = 富途入金 + B股入金 + 其他持仓成本 + 现金 − 场外杠杆 − 已平仓盈亏(A股+基金+港股招商)
+    Deposit mode:
+        Capital = 入金 + B股入金 + 其他持仓成本 + 现金 − 场外杠杆 − 非入金券商已平仓盈亏
 
     Cost mode (default for new users):
         Capital = 全部持仓成本 + 现金 − 场外杠杆 − 全部已平仓盈亏
@@ -326,14 +377,17 @@ def compute_capital(conn: sqlite3.Connection, fx: dict[str, float]) -> float:
     for row in conn.execute(
             "SELECT broker, market, currency, quantity, cost_price "
             "FROM positions WHERE status='open'"):
-        if DEPOSIT_MODE and (row['broker'] == '富途' or row['market'] == 'B股'):
-            continue  # covered by FUTU_CAPITAL / B_SHARE_CAPITAL
+        if DEPOSIT_MODE and (row['broker'] in DEPOSIT_BROKERS or row['market'] == 'B股'):
+            continue  # covered by deposit capital
         rate = fx.get(row['currency'], 1.0)
         position_cost += row['quantity'] * row['cost_price'] * rate
 
-    # Cash
+    # Cash — in deposit mode, exclude cash held at deposit-broker accounts
+    # (that cash is already part of the fixed deposit capital)
     cash_cny = 0.0
-    for row in conn.execute("SELECT currency, balance FROM cash_balances"):
+    for row in conn.execute("SELECT account, currency, balance FROM cash_balances"):
+        if DEPOSIT_MODE and row['account'] in DEPOSIT_BROKERS:
+            continue  # cash within deposit broker is part of deposit capital
         cash_cny += row['balance'] * fx.get(row['currency'], 1.0)
 
     # Off-exchange leverage
@@ -342,13 +396,14 @@ def compute_capital(conn: sqlite3.Connection, fx: dict[str, float]) -> float:
             "SELECT currency, amount FROM margin_balances WHERE category='off_exchange'"):
         margin_off += row['amount'] * fx.get(row['currency'], 1.0)
 
-    # Realised P&L
+    # Realised P&L — exclude deposit-covered brokers & B股
     realised_pl = 0.0
     if DEPOSIT_MODE:
-        # Deposit mode: only A股 + 基金 + 港股(招商) — 富途 P&L tracked via fixed deposit
         for row in conn.execute(
-                "SELECT COALESCE(realized_pnl_cny, 0) AS rpl FROM closed_trades "
-                "WHERE market IN ('A股', '基金') OR (market = '港股' AND broker = '招商')"):
+                "SELECT broker, market, COALESCE(realized_pnl_cny, 0) AS rpl "
+                "FROM closed_trades"):
+            if row['broker'] in DEPOSIT_BROKERS or row['market'] == 'B股':
+                continue  # P&L tracked via fixed deposit
             realised_pl += row['rpl']
     else:
         # Cost mode: ALL closed trades
