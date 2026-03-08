@@ -1,4 +1,4 @@
-# Investment Portfolio Dashboard — TODO
+# Portfolio Tracker — TODO
 
 ## Project Overview
 Streamlit-based personal investment portfolio tracker.

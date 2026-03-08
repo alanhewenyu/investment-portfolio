@@ -1,4 +1,4 @@
-# Investment Portfolio Tracker
+# Portfolio Tracker
 
 A Streamlit-based personal investment portfolio dashboard for tracking multi-broker, multi-currency holdings with real-time pricing.
 
@@ -23,8 +23,8 @@ A Streamlit-based personal investment portfolio dashboard for tracking multi-bro
 
 ```bash
 # Clone
-git clone https://github.com/alanhewenyu/investment-portfolio.git
-cd investment-portfolio
+git clone https://github.com/alanhewenyu/portfolio-tracker.git
+cd portfolio-tracker
 
 # Install dependencies
 pip install -r requirements.txt
@@ -91,7 +91,7 @@ Set up a cron job to capture daily NAV:
 
 ```bash
 # Example: run at 6:00 AM daily
-0 6 * * * cd /path/to/investment-portfolio && python snapshot.py >> snapshot.log 2>&1
+0 6 * * * cd /path/to/portfolio-tracker && python snapshot.py >> snapshot.log 2>&1
 ```
 
 ## Tech Stack

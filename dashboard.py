@@ -22,7 +22,7 @@ init_db()  # ensure migrations (e.g. created_at) are applied
 # 2026 seed: 3/6 (Fri) closing prices (migrated from hardcoded dict).
 # Future years: auto-recorded on first snapshot of new year via prev_close.
 
-st.set_page_config(page_title="Investment Portfolio", page_icon="◼", layout="wide")
+st.set_page_config(page_title="Portfolio Tracker", page_icon="◼", layout="wide")
 
 # ────────────────────────────────────────
 # CSS
@@ -2936,7 +2936,7 @@ def main():
     # Title
     st.markdown(
         '<div style="display:flex;align-items:baseline;gap:16px;">'
-        '<h2 style="margin:0;">Investment Portfolio</h2>'
+        '<h2 style="margin:0;">Portfolio Tracker</h2>'
         '<span style="font-size:11px;color:var(--pf-text2);font-style:italic;">in CNY, unless otherwise noted</span>'
         f'<span style="font-size:12px;color:var(--pf-text2);font-family:var(--pf-mono);">'
         f'{pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")}</span>'

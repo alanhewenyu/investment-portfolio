@@ -9,7 +9,7 @@ Usage:
     python3 snapshot.py --dry-run    # print without writing to DB
 
 Cron (run at 06:00 Beijing time every day):
-    0 6 * * * cd /Users/Alan/investment-portfolio && /usr/bin/env python3 snapshot.py >> snapshot.log 2>&1
+    0 6 * * * cd /Users/Alan/portfolio-tracker && /usr/bin/env python3 snapshot.py >> snapshot.log 2>&1
 """
 
 import json
@@ -171,7 +171,7 @@ def take_snapshot(dry_run=False):
 
 
 def backup_db(keep_daily=7):
-    """Backup portfolio.db to ~/Documents/investment-portfolio-backup/.
+    """Backup portfolio.db to ~/Documents/backup/portfolio-tracker/.
 
     ~/Documents is synced to iCloud on macOS, providing automatic cloud backup.
 
@@ -179,7 +179,7 @@ def backup_db(keep_daily=7):
       - Keep the last `keep_daily` daily backups (default: 7)
       - Keep the 1st-of-month backup indefinitely (monthly archive)
     """
-    backup_dir = Path.home() / "Documents" / "backup" / "investment-portfolio"
+    backup_dir = Path.home() / "Documents" / "backup" / "portfolio-tracker"
     backup_dir.mkdir(parents=True, exist_ok=True)
 
     src = Path(DB_PATH)
