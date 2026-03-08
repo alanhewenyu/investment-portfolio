@@ -26,24 +26,24 @@ Streamlit-based personal investment portfolio tracker.
 - [ ] Snapshot record & restore regression tests
 
 #### 1.2 Reliability
-- [ ] Yahoo Finance retry with backoff (2 retries, 1s delay) — `tenacity` or simple loop
-- [ ] A-share price source: replace yfinance with domestic API (东方财富/新浪) for .SS/.SZ tickers — lower latency, more reliable
-- [ ] FX fallback source: add backup (e.g. exchangerate.host) when Yahoo FX fails
-- [ ] Module-level `ThreadPoolExecutor` reuse (avoid create/destroy per call)
+- [x] Yahoo Finance retry with backoff (2 retries, linear backoff in `_retry()`)
+- [x] A-share price source: 东方财富 domestic API as primary, yfinance fallback
+- [x] FX fallback source: exchangerate.host when Yahoo FX fails
+- [x] Module-level `ThreadPoolExecutor` reuse (shared `_pool` in prices.py)
 
 #### 1.3 Architecture
 - [ ] Split `render_kpi()` (~350 lines) into `compute_pnl()` + `render_kpi_cards()` + `render_pnl_strips()`
 - [ ] Extract price-fetching side effects from `build_portfolio()` (decouple from `@st.cache_data`)
-- [ ] Unified `logging` module (replace `print()` + `pass` throughout)
-- [ ] `prefetch_all()` — run FX and prices in parallel (save ~3-5s)
-- [ ] Type hints for core functions
+- [x] Unified `logging` module (replaced `print()`/`sys.stderr` with `logging.getLogger`)
+- [x] `prefetch_all()` — run FX and prices in parallel via `_pool.submit()`
+- [x] Type hints for core functions (db.py, prices.py, fmp.py)
 
 ### 2. Product Features
 
 #### 2.1 Net Asset Value Chart ✅
 - [x] Plot cumulative NAV curve from `daily_snapshots` table
 - [x] Compare against benchmarks (CSI 300, S&P 500, Hang Seng)
-- [ ] Show alpha / excess return
+- [x] Show alpha / excess return (strip below chart when benchmarks enabled)
 
 #### 2.2 Return Attribution ✅
 - [x] Per-market YTD contribution breakdown (哪个市场赚最多)
@@ -51,9 +51,10 @@ Streamlit-based personal investment portfolio tracker.
 - [ ] Per-currency FX impact attribution
 
 #### 2.3 Risk Analytics
-- [ ] Volatility (annualized, from daily snapshots)
-- [ ] Maximum drawdown (peak-to-trough)
-- [ ] Sharpe ratio
+- [x] Volatility (annualized, from daily snapshots)
+- [x] Maximum drawdown (peak-to-trough, with date range)
+- [x] Sharpe ratio (rf=1.5% CNY)
+- [x] Win rate + Calmar ratio
 - [ ] Position concentration alerts (single stock > threshold)
 - [ ] Correlation heatmap between holdings
 

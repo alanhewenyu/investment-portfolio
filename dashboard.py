@@ -1583,6 +1583,7 @@ def render_performance(current_capital=None):
         return
 
     fig = go.Figure()
+    _alpha_html = None
 
     if _show_bench:
         # ── Normalized return comparison mode ──
@@ -1626,6 +1627,32 @@ def render_performance(current_capital=None):
                 customdata=_b_ret,
             ))
 
+        # Compute alpha (excess return) vs each benchmark
+        _port_total_ret = nav_df['nav_indexed'].iloc[-1] - 100
+        _alpha_parts = []
+        for bname, bdf in bench_data.items():
+            bdf = bdf[(bdf['date'] >= nav_df['date'].min()) & (bdf['date'] <= nav_df['date'].max())]
+            if bdf.empty:
+                continue
+            _bs = bdf.iloc[0]['close']
+            if _bs == 0:
+                continue
+            _bench_ret = (bdf.iloc[-1]['close'] / _bs - 1) * 100
+            _excess = _port_total_ret - _bench_ret
+            _color = 'var(--pf-green)' if _excess >= 0 else 'var(--pf-red)'
+            _sign = '+' if _excess >= 0 else ''
+            _alpha_parts.append(
+                f'<span style="margin:0 8px;">vs {bname}: '
+                f'<b style="color:{_color};">{_sign}{_excess:.1f}%</b></span>'
+            )
+        if _alpha_parts:
+            _alpha_html = (
+                '<div style="text-align:center;font-size:11px;font-family:var(--pf-mono);'
+                'color:var(--pf-text2);margin-top:-8px;margin-bottom:8px;">'
+                f'Alpha (excess return): {"".join(_alpha_parts)}'
+                '</div>'
+            )
+
         _y_title = 'Indexed (100 = start)'
         _y_fmt = None
     else:
@@ -1668,6 +1695,92 @@ def render_performance(current_capital=None):
     )
 
     st.plotly_chart(fig, use_container_width=True)
+
+    # Show alpha strip when benchmarks are enabled
+    if _alpha_html:
+        st.markdown(_alpha_html, unsafe_allow_html=True)
+
+
+# ────────────────────────────────────────
+# Risk Analytics
+# ────────────────────────────────────────
+
+def render_risk_analytics():
+    """Risk metrics: annualized volatility, max drawdown, Sharpe ratio."""
+    snap_df = load_snapshots()
+    if snap_df.empty or len(snap_df) < 10:
+        return  # Need at least 10 data points for meaningful stats
+
+    snap = snap_df.sort_values('date').copy()
+    snap['date_dt'] = pd.to_datetime(snap['date'])
+    snap['nav'] = snap['net_assets'].astype(float)
+
+    # Daily returns (log returns for better statistical properties)
+    snap['daily_ret'] = snap['nav'].pct_change()
+    snap = snap.dropna(subset=['daily_ret'])
+    if len(snap) < 10:
+        return
+
+    returns = snap['daily_ret']
+
+    # ── Annualized volatility ──
+    daily_vol = returns.std()
+    annual_vol = daily_vol * (252 ** 0.5)  # annualize
+
+    # ── Maximum drawdown ──
+    cummax = snap['nav'].cummax()
+    drawdown = (snap['nav'] - cummax) / cummax
+    max_dd = drawdown.min()  # most negative = worst drawdown
+    # Drawdown duration
+    _dd_end_idx = drawdown.idxmin()
+    _dd_end_date = snap.loc[_dd_end_idx, 'date']
+    _peak_nav = cummax.loc[_dd_end_idx]
+    _peak_mask = (snap['nav'] == _peak_nav) & (snap.index <= _dd_end_idx)
+    _dd_start_date = snap.loc[_peak_mask.idxmax(), 'date'] if _peak_mask.any() else _dd_end_date
+
+    # ── Sharpe ratio (annualized, risk-free = 1.5% for CNY) ──
+    rf_daily = 0.015 / 252
+    excess_ret = returns.mean() - rf_daily
+    sharpe = (excess_ret / daily_vol) * (252 ** 0.5) if daily_vol > 0 else 0
+
+    # ── Win rate ──
+    win_days = (returns > 0).sum()
+    total_days = len(returns)
+    win_rate = win_days / total_days * 100
+
+    # ── Calmar ratio (annualized return / max drawdown) ──
+    total_ret = snap['nav'].iloc[-1] / snap['nav'].iloc[0] - 1
+    years = (snap['date_dt'].iloc[-1] - snap['date_dt'].iloc[0]).days / 365.25
+    annual_ret = (1 + total_ret) ** (1 / years) - 1 if years > 0 else 0
+    calmar = abs(annual_ret / max_dd) if max_dd != 0 else 0
+
+    # ── Render ──
+    st.markdown('<div class="section-title">Risk Analytics</div>', unsafe_allow_html=True)
+
+    def _risk_card(label, value, sub='', color='var(--pf-text)'):
+        return (
+            f'<div style="text-align:center;padding:8px 4px;">'
+            f'<div style="font-size:11px;color:var(--pf-text2);margin-bottom:2px;">{label}</div>'
+            f'<div style="font-size:18px;font-weight:700;font-family:var(--pf-mono);color:{color};">{value}</div>'
+            f'<div style="font-size:10px;color:var(--pf-text2);opacity:0.7;margin-top:1px;">{sub}</div>'
+            f'</div>'
+        )
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1:
+        _vol_color = 'var(--pf-green)' if annual_vol < 0.15 else ('var(--pf-text)' if annual_vol < 0.25 else 'var(--pf-red)')
+        st.markdown(_risk_card('Ann. Volatility', f'{annual_vol:.1%}', f'daily σ={daily_vol:.2%}', _vol_color), unsafe_allow_html=True)
+    with c2:
+        st.markdown(_risk_card('Max Drawdown', f'{max_dd:.1%}', f'{_dd_start_date}→{_dd_end_date}', 'var(--pf-red)'), unsafe_allow_html=True)
+    with c3:
+        _sh_color = 'var(--pf-green)' if sharpe > 1 else ('var(--pf-text)' if sharpe > 0 else 'var(--pf-red)')
+        st.markdown(_risk_card('Sharpe Ratio', f'{sharpe:.2f}', 'rf=1.5% (CNY)', _sh_color), unsafe_allow_html=True)
+    with c4:
+        _wr_color = 'var(--pf-green)' if win_rate > 50 else 'var(--pf-red)'
+        st.markdown(_risk_card('Win Rate', f'{win_rate:.0f}%', f'{win_days}W / {total_days - win_days}L', _wr_color), unsafe_allow_html=True)
+    with c5:
+        _cal_color = 'var(--pf-green)' if calmar > 1 else ('var(--pf-text)' if calmar > 0.5 else 'var(--pf-red)')
+        st.markdown(_risk_card('Calmar Ratio', f'{calmar:.2f}', f'ret={annual_ret:.1%}/yr', _cal_color), unsafe_allow_html=True)
 
 
 # ────────────────────────────────────────
@@ -2806,6 +2919,7 @@ def main():
             · FX & Other: <b class="{_fx_cls}">{_pnl_sign(_forex_gl)}</b>
         </div>''', unsafe_allow_html=True)
 
+    render_risk_analytics()
     render_attribution(df, fx)
     render_pnl_journal(df, fx)
     render_closed(fx)

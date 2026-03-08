@@ -11,13 +11,17 @@ API key: set FMP_API_KEY environment variable (optional).
 Cache: 30-day TTL in industry_cache table (industry rarely changes).
 """
 
+from __future__ import annotations
+
+import logging
 import os
-import sys
 import time
 import sqlite3
 from datetime import datetime
 
 import requests
+
+logger = logging.getLogger(__name__)
 
 from db import DB_PATH
 
@@ -81,7 +85,7 @@ def _cache_result(ticker, sector, industry, db_path=None):
 
 # ── API fetch ─────────────────────────────────────────────
 
-def _is_chinese_ticker(ticker):
+def _is_chinese_ticker(ticker: str) -> bool:
     """Check if ticker is a Chinese stock (.SS/.SZ) or mutual fund (6-digit code)."""
     if ticker.endswith('.SS') or ticker.endswith('.SZ'):
         return True
@@ -91,7 +95,7 @@ def _is_chinese_ticker(ticker):
     return False
 
 
-def _akshare_fallback(ticker):
+def _akshare_fallback(ticker: str) -> tuple[str, str]:
     """Fetch (sector, industry) for Chinese stocks/funds via akshare (free).
 
     Covers A-shares, B-shares (.SS/.SZ) and Chinese mutual funds (6-digit codes).
@@ -132,7 +136,7 @@ def _akshare_fallback(ticker):
     return '', ''
 
 
-def _yfinance_fallback(ticker):
+def _yfinance_fallback(ticker: str) -> tuple[str, str]:
     """Free fallback: fetch (sector, industry) via yfinance.
 
     Works for US stocks, HK (.HK), Japan (.T).
@@ -160,7 +164,7 @@ def _to_fmp_ticker(ticker):
     return ticker
 
 
-def fetch_profile(ticker, db_path=None):
+def fetch_profile(ticker: str, db_path: str | None = None) -> tuple[str, str]:
     """Fetch (sector, industry) for a single ticker. Uses cache first."""
     if not ticker:
         return '', ''
@@ -203,7 +207,7 @@ def fetch_profile(ticker, db_path=None):
                     _cache_result(ticker, sector, industry, db_path)
                     return sector, industry
         except Exception as e:
-            print(f"  FMP profile fetch failed for {fmp_ticker}: {e}", file=sys.stderr)
+            logger.warning("FMP profile fetch failed for %s: %s", fmp_ticker, e)
 
     # Free fallback: akshare for Chinese stocks/funds
     if _is_chinese_ticker(ticker):
@@ -246,7 +250,7 @@ def _get_all_cached(tickers, db_path=None):
         return {}
 
 
-def fetch_all_industries(tickers, db_path=None):
+def fetch_all_industries(tickers: list[str], db_path: str | None = None) -> dict[str, tuple[str, str]]:
     """Batch fetch sector/industry for a list of tickers.
 
     Returns {ticker: (sector, industry)}.

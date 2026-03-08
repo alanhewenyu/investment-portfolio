@@ -1,8 +1,11 @@
 """Portfolio database schema and CRUD operations."""
 
+from __future__ import annotations
+
 import sqlite3
 import os
 from datetime import datetime
+from typing import Any
 
 try:
     from dotenv import load_dotenv
@@ -135,7 +138,7 @@ CREATE INDEX IF NOT EXISTS idx_ytd_year ON ytd_baseline_prices(year);
 """
 
 
-def get_conn(db_path=None):
+def get_conn(db_path: str | None = None) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path or DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
@@ -309,7 +312,7 @@ B_SHARE_CAPITAL = float(os.environ.get('B_SHARE_CAPITAL', '0'))   # B股历史�
 DEPOSIT_MODE = FUTU_CAPITAL > 0 or B_SHARE_CAPITAL > 0
 
 
-def compute_capital(conn, fx):
+def compute_capital(conn: sqlite3.Connection, fx: dict[str, float]) -> float:
     """Compute total invested capital (CNY).
 
     Deposit mode (FUTU_CAPITAL > 0 or B_SHARE_CAPITAL > 0):
@@ -357,7 +360,7 @@ def compute_capital(conn, fx):
     return base + cash_cny - margin_off - realised_pl
 
 
-def init_db(db_path=None):
+def init_db(db_path: str | None = None) -> None:
     with get_conn(db_path) as conn:
         conn.executescript(SCHEMA)
         _migrate_closed_trades(conn)
@@ -372,7 +375,8 @@ def init_db(db_path=None):
         _migrate_seed_ytd_2026(conn)
 
 
-def upsert_position(conn, ticker, name, market, broker, currency, quantity, cost_price):
+def upsert_position(conn: sqlite3.Connection, ticker: str, name: str, market: str,
+                    broker: str, currency: str, quantity: float, cost_price: float) -> None:
     conn.execute("""
         INSERT INTO positions (ticker, name, market, broker, currency, quantity, cost_price,
                                status, updated_at, created_at)
@@ -394,9 +398,12 @@ def upsert_position(conn, ticker, name, market, broker, currency, quantity, cost
     """, (ticker, name, market, broker, currency, quantity, cost_price))
 
 
-def insert_closed_trade(conn, ticker, name, market, broker, currency, realized_pnl,
-                        close_date=None, notes=None, quantity=None, cost_price=None,
-                        close_price=None, cost_total=None, realized_pnl_cny=None):
+def insert_closed_trade(conn: sqlite3.Connection, ticker: str | None, name: str,
+                        market: str, broker: str, currency: str, realized_pnl: float,
+                        close_date: str | None = None, notes: str | None = None,
+                        quantity: float | None = None, cost_price: float | None = None,
+                        close_price: float | None = None, cost_total: float | None = None,
+                        realized_pnl_cny: float | None = None) -> None:
     conn.execute("""
         INSERT INTO closed_trades (ticker, name, market, broker, currency, realized_pnl,
                                    close_date, notes, quantity, cost_price, close_price,
@@ -406,7 +413,7 @@ def insert_closed_trade(conn, ticker, name, market, broker, currency, realized_p
           close_date, notes, quantity, cost_price, close_price, cost_total, realized_pnl_cny))
 
 
-def upsert_cash(conn, account, currency, balance):
+def upsert_cash(conn: sqlite3.Connection, account: str, currency: str, balance: float) -> None:
     conn.execute("""
         INSERT INTO cash_balances (account, currency, balance, updated_at)
         VALUES (?, ?, ?, datetime('now','localtime'))
@@ -416,7 +423,8 @@ def upsert_cash(conn, account, currency, balance):
     """, (account, currency, balance))
 
 
-def upsert_nav(conn, date, nav, capital, pnl, equity_nav=None, benchmark=None):
+def upsert_nav(conn: sqlite3.Connection, date: str, nav: float, capital: float,
+               pnl: float, equity_nav: float | None = None, benchmark: float | None = None) -> None:
     conn.execute("""
         INSERT INTO nav_history (date, net_asset_value, capital_invested, pnl, equity_nav, benchmark_value)
         VALUES (?, ?, ?, ?, ?, ?)
@@ -429,7 +437,7 @@ def upsert_nav(conn, date, nav, capital, pnl, equity_nav=None, benchmark=None):
     """, (date, nav, capital, pnl, equity_nav, benchmark))
 
 
-def upsert_fx(conn, currency, rate):
+def upsert_fx(conn: sqlite3.Connection, currency: str, rate: float) -> None:
     conn.execute("""
         INSERT INTO fx_rates (currency, rate_to_cny, updated_at)
         VALUES (?, ?, datetime('now','localtime'))
@@ -439,7 +447,8 @@ def upsert_fx(conn, currency, rate):
     """, (currency, rate))
 
 
-def upsert_margin(conn, broker, category, currency, amount):
+def upsert_margin(conn: sqlite3.Connection, broker: str, category: str,
+                  currency: str, amount: float) -> None:
     conn.execute("""
         INSERT INTO margin_balances (broker, category, currency, amount, updated_at)
         VALUES (?, ?, ?, ?, datetime('now','localtime'))
@@ -449,8 +458,10 @@ def upsert_margin(conn, broker, category, currency, amount):
     """, (broker, category, currency, amount))
 
 
-def upsert_snapshot(conn, date, total_assets, net_assets, equity_mv, cash, leverage, total_pnl,
-                    market_data=None, capital=None, market_detail=None):
+def upsert_snapshot(conn: sqlite3.Connection, date: str, total_assets: float,
+                    net_assets: float, equity_mv: float, cash: float, leverage: float,
+                    total_pnl: float, market_data: str | None = None,
+                    capital: float | None = None, market_detail: dict | None = None) -> None:
     """Record daily snapshot — first write of the day wins (no overwrite).
 
     This ensures a stable baseline for "Last 1d" / weekly comparisons:
@@ -477,7 +488,7 @@ def upsert_snapshot(conn, date, total_assets, net_assets, equity_mv, cash, lever
                     """, (date, market, currency, mv))
 
 
-def get_ytd_baselines(conn, year):
+def get_ytd_baselines(conn: sqlite3.Connection, year: int) -> dict[str, dict]:
     """Get YTD baseline data for a given year.
 
     Returns {ticker: {'price': float, 'quantity': float|None, 'cost_price': float|None}}.
@@ -497,7 +508,7 @@ def get_ytd_baselines(conn, year):
     return result
 
 
-def record_ytd_baselines(conn, year, ticker_data, date):
+def record_ytd_baselines(conn: sqlite3.Connection, year: int, ticker_data: dict, date: str) -> None:
     """Bulk-insert YTD baseline prices (INSERT OR IGNORE — first write wins).
 
     ticker_data: dict {ticker: (price, currency)} or {ticker: (price, currency, qty, cost_price)}

@@ -1,12 +1,21 @@
 """Real-time price and FX rate fetching with caching."""
 
+from __future__ import annotations
+
 import datetime
+import logging
 import re
-import sys
 import time as _time
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from typing import Callable
+
 from db import DB_PATH
+
+logger = logging.getLogger(__name__)
+
+# Module-level thread pool — reused across all calls (avoids create/destroy overhead)
+_pool = ThreadPoolExecutor(max_workers=8)
 
 # ── Price cache ──────────────────────────────────────────
 
@@ -24,7 +33,7 @@ _MAX_RETRIES = 2
 _RETRY_DELAY = 1.0  # seconds
 
 
-def _retry(fn, retries=_MAX_RETRIES, delay=_RETRY_DELAY):
+def _retry(fn: Callable, retries: int = _MAX_RETRIES, delay: float = _RETRY_DELAY):
     """Call fn() with retries on exception. Returns fn() result or re-raises last exception."""
     last_exc = None
     for attempt in range(retries + 1):
@@ -39,7 +48,7 @@ def _retry(fn, retries=_MAX_RETRIES, delay=_RETRY_DELAY):
 
 # ── A-share domestic API fallback (东方财富) ──────────────
 
-def _fetch_ashare_domestic(ticker):
+def _fetch_ashare_domestic(ticker: str) -> tuple[float, str, float | None]:
     """Fetch A-share price from 东方财富 API. Returns (price, 'CNY', prev_close) or raises."""
     import requests
     # Map yfinance ticker to eastmoney secid: 600xxx.SS → 1.600xxx, 000xxx.SZ → 0.000xxx
@@ -73,7 +82,7 @@ def _fetch_ashare_domestic(ticker):
     return (price, 'CNY', prev_close)
 
 
-def _infer_currency(ticker):
+def _infer_currency(ticker: str) -> str | None:
     """Infer trading currency from ticker suffix (best-effort)."""
     if not ticker:
         return None
@@ -86,7 +95,7 @@ def _infer_currency(ticker):
     return 'USD'
 
 
-def fetch_fund_nav(code):
+def fetch_fund_nav(code: str) -> tuple[float | None, str | None, float | None]:
     """Fetch fund NAV from 天天基金网 (eastmoney). Returns (nav, 'CNY', prev_nav) or (None, None, None)."""
     try:
         import requests
@@ -116,8 +125,7 @@ def fetch_fund_nav(code):
                         pass
                 return nav, 'CNY', prev_nav
     except Exception as e:
-        import sys
-        print(f"  fund NAV fetch failed for {code}: {e}", file=sys.stderr)
+        logger.warning("fund NAV fetch failed for %s: %s", code, e)
     return None, None, None
 
 
@@ -200,7 +208,7 @@ def _fetch_yfinance(ticker, currency, regular_only=False):
         return (price, currency, prev_close)
 
 
-def fetch_price(ticker, regular_only=False):
+def fetch_price(ticker: str, regular_only: bool = False) -> tuple[float | None, str | None]:
     """Fetch latest price for a ticker via yfinance (or eastmoney for funds).
     Returns (price, currency) or (None, None).
     Also caches previous_close — access via get_previous_close(ticker).
@@ -229,18 +237,18 @@ def fetch_price(ticker, regular_only=False):
             try:
                 result = _retry(lambda: _fetch_ashare_domestic(ticker))
             except Exception as e_dom:
-                print(f"  domestic API failed for {ticker}: {e_dom}, trying yfinance...", file=sys.stderr)
+                logger.warning("domestic API failed for %s: %s, trying yfinance...", ticker, e_dom)
                 try:
                     result = _retry(lambda: _fetch_yfinance(ticker, currency, regular_only))
                 except Exception as e_yf:
-                    print(f"  yfinance also failed for {ticker}: {e_yf}", file=sys.stderr)
+                    logger.warning("yfinance also failed for %s: %s", ticker, e_yf)
                     result = (None, None, None)
         else:
             # All other markets: yfinance with retry
             try:
                 result = _retry(lambda: _fetch_yfinance(ticker, currency, regular_only))
             except Exception as e:
-                print(f"  price fetch failed for {ticker}: {e}", file=sys.stderr)
+                logger.warning("price fetch failed for %s: %s", ticker, e)
                 result = (None, None, None)
 
     # Only cache successful fetches; failed ones (None) should be retried immediately
@@ -249,7 +257,7 @@ def fetch_price(ticker, regular_only=False):
     return result[0], result[1]
 
 
-def get_previous_close(ticker):
+def get_previous_close(ticker: str) -> float | None:
     """Get cached previous close price for a ticker. Call fetch_price first."""
     cached = _price_cache.get(ticker)
     if cached:
@@ -257,7 +265,7 @@ def get_previous_close(ticker):
     return None
 
 
-def fetch_fx_rate(currency):
+def fetch_fx_rate(currency: str) -> float | None:
     """Fetch FX rate to CNY. Returns rate or None."""
     if not currency or currency == 'CNY':
         return 1.0
@@ -301,7 +309,7 @@ def fetch_fx_rate(currency):
     return result
 
 
-def get_fx_rates():
+def get_fx_rates() -> dict[str, float]:
     """Get all FX rates (from DB as fallback, then try live).
 
     When live rates are fetched successfully they are persisted to the
@@ -321,8 +329,7 @@ def get_fx_rates():
     # Try live rates in parallel (3 requests at once instead of sequential)
     _fx_currencies = ('USD', 'HKD', 'JPY')
     try:
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            _fx_results = list(pool.map(fetch_fx_rate, _fx_currencies, timeout=15))
+        _fx_results = list(_pool.map(fetch_fx_rate, _fx_currencies, timeout=15))
     except Exception:
         _fx_results = [None, None, None]
 
@@ -334,9 +341,8 @@ def get_fx_rates():
             if db_rate and db_rate > 0:
                 deviation = abs(live - db_rate) / db_rate
                 if deviation > 0.15:
-                    import sys
-                    print(f"  FX sanity check REJECTED {cur}: live={live:.6f} "
-                          f"vs db={db_rate:.6f} (deviation={deviation:.0%})", file=sys.stderr)
+                    logger.warning("FX sanity check REJECTED %s: live=%.6f vs db=%.6f (deviation=%.0f%%)",
+                                   cur, live, db_rate, deviation * 100)
                     continue  # keep DB fallback
             rates[cur] = live
             _updated.append((cur, live))
@@ -360,7 +366,7 @@ def get_fx_rates():
     return rates
 
 
-def refresh_all_prices(db_path=None):
+def refresh_all_prices(db_path: str | None = None) -> dict[str, tuple[float, str]]:
     """Fetch prices for all open positions. Returns {ticker: (price, currency)}."""
     path = db_path or DB_PATH
     with sqlite3.connect(path) as conn:
@@ -377,13 +383,14 @@ def refresh_all_prices(db_path=None):
         if p:
             results[t] = (p, c)
 
-    with ThreadPoolExecutor(max_workers=min(len(tickers), 6)) as pool:
-        list(pool.map(_fetch, tickers))  # consume iterator to propagate exceptions
+    list(_pool.map(_fetch, tickers))  # consume iterator to propagate exceptions
 
     return results
 
 
-def prefetch_all():
-    """Prefetch FX rates and all position prices in background."""
-    get_fx_rates()
-    refresh_all_prices()
+def prefetch_all() -> None:
+    """Prefetch FX rates and all position prices in parallel."""
+    fx_future = _pool.submit(get_fx_rates)
+    prices_future = _pool.submit(refresh_all_prices)
+    fx_future.result(timeout=30)
+    prices_future.result(timeout=60)
