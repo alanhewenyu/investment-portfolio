@@ -1,7 +1,13 @@
-"""FMP API client for sector/industry classification with SQLite caching.
+"""Industry classification with multi-source fallback and SQLite caching.
 
-Uses Financial Modeling Prep v3 API to fetch company profiles.
-API key: set FMP_API_KEY environment variable.
+Priority chain:
+  1. ETF mapping (static, for known index ETFs)
+  2. SQLite cache (30-day TTL)
+  3. FMP API (if FMP_API_KEY is set)
+  4. akshare (Chinese A/B-shares and mutual funds — free, via 东方财富)
+  5. yfinance (US, HK, JP stocks — free)
+
+API key: set FMP_API_KEY environment variable (optional).
 Cache: 30-day TTL in industry_cache table (industry rarely changes).
 """
 
@@ -18,18 +24,6 @@ from db import DB_PATH
 FMP_API_KEY = os.environ.get("FMP_API_KEY", "")
 FMP_BASE = "https://financialmodelingprep.com/api/v3"
 _CACHE_TTL = 86400 * 30  # 30 days
-
-# Manual industry mapping for tickers FMP can't resolve (B-shares, funds, etc.)
-# B-share industry is same as corresponding A-share
-_MANUAL_INDUSTRY = {
-    '900928.SS': ('Real Estate', 'Real Estate - Services'),           # 临港B
-    '900905.SS': ('Consumer Cyclical', 'Luxury Goods'),               # 老凤祥B → 600612.SS
-    '900936.SS': ('Consumer Cyclical', 'Textile Manufacturing'),      # 鄂资B (鄂绒)
-    '900903.SS': ('Utilities', 'Regulated Gas'),                      # 大众B → 600635.SS
-    '201872.SZ': ('Industrials', 'Marine Shipping'),                  # 招港B → 001872.SZ
-    # Chinese funds / OTC funds — FMP can't resolve these
-    '001071':    ('ETF', 'Mixed - TMT'),                              # 华安媒体互联网混合
-}
 
 # ETF description mapping — describes what the ETF tracks (for display)
 _ETF_INDUSTRY = {
@@ -87,12 +81,62 @@ def _cache_result(ticker, sector, industry, db_path=None):
 
 # ── API fetch ─────────────────────────────────────────────
 
+def _is_chinese_ticker(ticker):
+    """Check if ticker is a Chinese stock (.SS/.SZ) or mutual fund (6-digit code)."""
+    if ticker.endswith('.SS') or ticker.endswith('.SZ'):
+        return True
+    # Pure 6-digit numeric code → likely a Chinese mutual fund
+    if len(ticker) == 6 and ticker.isdigit():
+        return True
+    return False
+
+
+def _akshare_fallback(ticker):
+    """Fetch (sector, industry) for Chinese stocks/funds via akshare (free).
+
+    Covers A-shares, B-shares (.SS/.SZ) and Chinese mutual funds (6-digit codes).
+    Data source: 东方财富 via akshare library.
+    """
+    try:
+        import akshare as ak
+    except ImportError:
+        return '', ''
+
+    # ── Chinese stock (A-share or B-share) ──
+    if ticker.endswith('.SS') or ticker.endswith('.SZ'):
+        code = ticker.split('.')[0]  # Strip .SS/.SZ suffix for akshare
+        try:
+            df = ak.stock_individual_info_em(symbol=code)
+            row = df[df['item'] == '行业']
+            if not row.empty:
+                industry = str(row.iloc[0]['value']).strip()
+                if industry and industry != 'nan':
+                    return industry, industry
+        except Exception:
+            pass
+        return '', ''
+
+    # ── Chinese mutual fund (6-digit code, no suffix) ──
+    if len(ticker) == 6 and ticker.isdigit():
+        try:
+            df = ak.fund_individual_basic_info_xq(symbol=ticker)
+            row = df[df['item'] == '基金类型']
+            if not row.empty:
+                fund_type = str(row.iloc[0]['value']).strip()
+                if fund_type and fund_type != 'nan':
+                    return '基金', fund_type
+        except Exception:
+            pass
+        return '', ''
+
+    return '', ''
+
+
 def _yfinance_fallback(ticker):
     """Free fallback: fetch (sector, industry) via yfinance.
 
     Works for US stocks, HK (.HK), Japan (.T).
-    Chinese A-shares (.SS/.SZ), funds, B-shares are covered by
-    _MANUAL_INDUSTRY and should never reach this function.
+    Chinese A-shares, B-shares, and funds are handled by _akshare_fallback().
     """
     try:
         import yfinance as yf
@@ -133,12 +177,6 @@ def fetch_profile(ticker, db_path=None):
     if cached and (cached[0] or cached[1]):
         return cached
 
-    # Check manual mapping (B-shares, funds, etc.)
-    if ticker in _MANUAL_INDUSTRY:
-        sector, industry = _MANUAL_INDUSTRY[ticker]
-        _cache_result(ticker, sector, industry, db_path)
-        return sector, industry
-
     # Try FMP API if key is available
     if FMP_API_KEY:
         fmp_ticker = _to_fmp_ticker(ticker)
@@ -166,6 +204,13 @@ def fetch_profile(ticker, db_path=None):
                     return sector, industry
         except Exception as e:
             print(f"  FMP profile fetch failed for {fmp_ticker}: {e}", file=sys.stderr)
+
+    # Free fallback: akshare for Chinese stocks/funds
+    if _is_chinese_ticker(ticker):
+        sector, industry = _akshare_fallback(ticker)
+        if sector or industry:
+            _cache_result(ticker, sector, industry, db_path)
+            return sector, industry
 
     # Free fallback: yfinance (works for US, HK, JP stocks — no API key needed)
     sector, industry = _yfinance_fallback(ticker)
@@ -218,11 +263,9 @@ def fetch_all_industries(tickers, db_path=None):
     uncached = []
 
     for t in clean_tickers:
-        # Check ETF / manual mappings first (these override cache)
+        # Check ETF mapping first (overrides cache)
         if t in _ETF_INDUSTRY:
             results[t] = _ETF_INDUSTRY[t]
-        elif t in _MANUAL_INDUSTRY:
-            results[t] = _MANUAL_INDUSTRY[t]
         elif t in cached_batch and (cached_batch[t][0] or cached_batch[t][1]):
             results[t] = cached_batch[t]
         else:

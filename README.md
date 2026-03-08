@@ -58,7 +58,7 @@ Copy `.env.example` to `.env` to customize (all settings are optional):
 | `FUTU_DEPOSIT_FX` | `1.0` | Average USD/CNY rate at deposit time (only used if FUTU_CAPITAL > 0) |
 | `B_SHARE_CAPITAL` | `0` | Historical CNY deposits for B-shares. Leave at 0 for cost-based capital. |
 | `PORTFOLIO_DB_PATH` | `./portfolio.db` | Custom SQLite database path |
-| `FMP_API_KEY` | _(empty)_ | FMP API key for industry data (optional — yfinance used as free fallback) |
+| `FMP_API_KEY` | _(empty)_ | FMP API key for industry data (optional — akshare + yfinance used as free fallback) |
 
 ### Capital Modes
 
@@ -82,7 +82,7 @@ db.py           — SQLite schema, migrations, capital calculation, CRUD operati
 prices.py       — Price fetching (yfinance, 天天基金), FX rates, caching
 snapshot.py     — Cron job for daily NAV snapshots
 import_excel.py — Bulk import from Excel (broker statement format)
-fmp.py          — Industry classification (FMP API + yfinance fallback)
+fmp.py          — Industry classification (FMP API / akshare / yfinance fallback)
 ```
 
 ## Daily Snapshots
@@ -100,7 +100,7 @@ Set up a cron job to capture daily NAV:
 - **Database**: SQLite (WAL mode)
 - **Prices**: yfinance, 天天基金 API
 - **FX**: Yahoo Finance with exchangerate.host fallback
-- **Industry**: yfinance (free) with optional FMP API upgrade
+- **Industry**: akshare (A/B股, 基金) + yfinance (US/HK/JP) with optional FMP API
 
 ## License
 
