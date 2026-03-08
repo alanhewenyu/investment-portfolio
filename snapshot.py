@@ -171,15 +171,21 @@ def take_snapshot(dry_run=False):
 
 
 def backup_db(keep_daily=7):
-    """Backup portfolio.db to ~/Documents/backup/portfolio-tracker/.
+    """Backup portfolio.db using SQLite backup API (safe, no corruption risk).
 
-    ~/Documents is synced to iCloud on macOS, providing automatic cloud backup.
+    Backup directory priority:
+      1. BACKUP_DIR env var (user-configured)
+      2. Default: ./backups/ (inside project directory)
+
+    Tip: set BACKUP_DIR to a cloud-synced folder for automatic off-site backup,
+    e.g. ~/Documents/backup/portfolio-tracker (iCloud on macOS).
 
     Retention policy:
       - Keep the last `keep_daily` daily backups (default: 7)
       - Keep the 1st-of-month backup indefinitely (monthly archive)
     """
-    backup_dir = Path.home() / "Documents" / "backup" / "portfolio-tracker"
+    _env_dir = os.environ.get("BACKUP_DIR", "").strip()
+    backup_dir = Path(_env_dir).expanduser() if _env_dir else Path(__file__).parent / "backups"
     backup_dir.mkdir(parents=True, exist_ok=True)
 
     src = Path(DB_PATH)

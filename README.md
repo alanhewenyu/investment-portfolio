@@ -1,48 +1,42 @@
 # Portfolio Tracker
 
-A Streamlit-based personal investment portfolio dashboard for tracking multi-broker, multi-currency holdings with real-time pricing.
+[中文](README_CN.md) | English
+
+A Streamlit-based investment portfolio dashboard for tracking multi-broker, multi-currency holdings with real-time pricing, risk analytics, and automated backups.
 
 ## Features
 
-- **Multi-Broker Support** — Track positions across any broker (e.g. 富途, 中信, Robinhood, Interactive Brokers)
-- **Multi-Currency** — USD, HKD, JPY, CNY with live FX conversion (all values in CNY)
-- **Multi-Market** — A股, B股, 港股, 美股, 日股, 基金
-- **Real-Time Prices** — Yahoo Finance for stocks, 天天基金 for Chinese mutual funds
+- **Multi-Broker** — Track positions across any number of brokers (e.g. Futu, CITIC, Robinhood, Interactive Brokers)
+- **Multi-Currency** — USD, HKD, JPY, CNY with live FX conversion; all values normalized to CNY
+- **Multi-Market** — A-shares, B-shares, HK, US, Japan, mutual funds
+- **Real-Time Prices** — Yahoo Finance for stocks, Tiantian Fund for Chinese mutual funds
 - **NAV Tracking** — Daily snapshots with cumulative NAV curve and benchmark comparison (CSI 300, S&P 500, Hang Seng)
+- **Risk Analytics** — Flow-adjusted volatility, Sharpe ratio, max drawdown, win rate, Calmar ratio with rolling trend chart
 - **Return Attribution** — Per-market and per-stock P&L contribution breakdown
-- **Industry Analysis** — Sector allocation via yfinance (free) or FMP API
+- **Industry Analysis** — Sector allocation via akshare + yfinance (free) or FMP API (optional)
+- **Automated Backup** — SQLite backup API with configurable directory, 7-day daily + monthly retention
 - **CSV Import** — Bulk import positions, cash, and closed trades via sidebar UI
 - **P&L Journal** — Rolling 30-day net P&L history from daily snapshots
 - **Capital Breakdown** — Detailed capital composition with flexible calculation modes
 
-## Screenshot
-
-> Add a screenshot of your dashboard here.
-
 ## Quick Start
 
 ```bash
-# Clone
 git clone https://github.com/alanhewenyu/portfolio-tracker.git
 cd portfolio-tracker
-
-# Install dependencies
 pip install -r requirements.txt
 
-# Configure environment (optional — works out-of-the-box with defaults)
+# Optional: customize settings
 cp .env.example .env
 
-# Run
 streamlit run dashboard.py
 ```
 
 ## Data Import
 
-Positions can be managed via:
-
 1. **Sidebar UI** — Add/edit/delete individual positions in the "Edit" tab
-2. **CSV Import** — Bulk import via the "Import" tab in the sidebar. Download CSV templates from the tab, fill in your data, and upload.
-3. **Excel Import** — CLI tool for specific broker statement format:
+2. **CSV Import** — Bulk import via the "Import" tab. Download templates, fill in your data, upload.
+3. **Excel Import** — CLI tool for broker statement format:
    ```bash
    export PORTFOLIO_EXCEL=~/Desktop/your_portfolio.xlsm
    python import_excel.py
@@ -50,57 +44,54 @@ Positions can be managed via:
 
 ## Configuration
 
-Copy `.env.example` to `.env` to customize (all settings are optional):
+Copy `.env.example` to `.env` (all settings are optional):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `FUTU_CAPITAL` | `0` | Historical CNY deposits to a specific broker. Leave at 0 for cost-based capital. |
-| `FUTU_DEPOSIT_FX` | `1.0` | Average USD/CNY rate at deposit time (only used if FUTU_CAPITAL > 0) |
-| `B_SHARE_CAPITAL` | `0` | Historical CNY deposits for B-shares. Leave at 0 for cost-based capital. |
+| `FUTU_CAPITAL` | `0` | Broker deposit amount (CNY). Leave at 0 for cost-based capital. |
+| `FUTU_DEPOSIT_FX` | `1.0` | Average USD/CNY rate at deposit time |
+| `B_SHARE_CAPITAL` | `0` | B-share deposit amount (CNY). Leave at 0 for cost-based capital. |
 | `PORTFOLIO_DB_PATH` | `./portfolio.db` | Custom SQLite database path |
-| `FMP_API_KEY` | _(empty)_ | FMP API key for industry data (optional — akshare + yfinance used as free fallback) |
+| `BACKUP_DIR` | `./backups` | Backup directory. Set to a cloud-synced folder for off-site backup. |
+| `FMP_API_KEY` | _(empty)_ | FMP API key for industry data (optional — free fallback available) |
 
 ### Capital Modes
 
-The tracker supports two capital calculation modes, auto-detected from environment variables:
+Auto-detected from environment variables:
 
-**Cost Mode** (default, recommended for new users):
-- When `FUTU_CAPITAL` and `B_SHARE_CAPITAL` are both 0
-- Capital = position cost + cash - off-exchange leverage - all realized P&L
-- Works out-of-the-box with zero configuration
+- **Cost Mode** (default) — Capital = position cost + cash - leverage - realized P&L. Zero configuration needed.
+- **Deposit Mode** — Set `FUTU_CAPITAL` or `B_SHARE_CAPITAL` > 0 for deposit-based tracking with FX impact analysis.
 
-**Deposit Mode** (advanced):
-- When either `FUTU_CAPITAL` or `B_SHARE_CAPITAL` is set to a non-zero value
-- Uses hardcoded deposit amounts for specific brokers
-- Enables detailed FX impact analysis and margin interest tracking
+## Daily Snapshots & Backup
+
+Set up a cron job to capture daily NAV and backup the database:
+
+```bash
+0 6 * * * cd /path/to/portfolio-tracker && python snapshot.py >> snapshot.log 2>&1
+```
+
+Backups are saved to `BACKUP_DIR` (default: `./backups/`). Retention: 7 daily + monthly archives (1st of each month, kept indefinitely).
+
+**Tip:** Set `BACKUP_DIR` to a cloud-synced folder (e.g. iCloud, Dropbox, Google Drive) for automatic off-site backup.
 
 ## Architecture
 
 ```
-dashboard.py    — Main Streamlit app (KPI cards, charts, tables, sidebar CRUD)
-db.py           — SQLite schema, migrations, capital calculation, CRUD operations
-prices.py       — Price fetching (yfinance, 天天基金), FX rates, caching
-snapshot.py     — Cron job for daily NAV snapshots
+dashboard.py    — Streamlit app (KPI, charts, tables, sidebar CRUD)
+db.py           — SQLite schema, migrations, capital calculation, CRUD
+prices.py       — Price fetching (yfinance, Tiantian Fund), FX rates, caching
+snapshot.py     — Daily NAV snapshots + database backup
 import_excel.py — Bulk import from Excel (broker statement format)
-fmp.py          — Industry classification (FMP API / akshare / yfinance fallback)
-```
-
-## Daily Snapshots
-
-Set up a cron job to capture daily NAV:
-
-```bash
-# Example: run at 6:00 AM daily
-0 6 * * * cd /path/to/portfolio-tracker && python snapshot.py >> snapshot.log 2>&1
+fmp.py          — Industry classification (FMP / akshare / yfinance fallback)
 ```
 
 ## Tech Stack
 
 - **Frontend**: Streamlit + Plotly
 - **Database**: SQLite (WAL mode)
-- **Prices**: yfinance, 天天基金 API
-- **FX**: Yahoo Finance with exchangerate.host fallback
-- **Industry**: akshare (A/B股, 基金) + yfinance (US/HK/JP) with optional FMP API
+- **Prices**: yfinance, Tiantian Fund API
+- **FX**: Yahoo Finance + exchangerate.host fallback
+- **Industry**: akshare + yfinance (free), optional FMP API
 
 ## License
 
