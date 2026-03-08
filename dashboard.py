@@ -1962,7 +1962,9 @@ def render_pnl_journal(df=None, fx=None):
             }
 
     # Override today's entry with real-time position-based daily P&L
-    if _rt_daily_pnl is not None:
+    # Skip weekends — markets closed, data is stale replay of Friday
+    _is_weekend = pd.Timestamp.now().dayofweek >= 5
+    if _rt_daily_pnl is not None and not _is_weekend:
         _today_nav = pnl_lookup.get(_today_str, {}).get('nav')
         _today_cap = _cap_lookup.get(_today_str)
         if _today_nav is None and not snap_df.empty:
