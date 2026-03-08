@@ -882,8 +882,10 @@ def _record_snapshot(net_assets, equity_mv, cash_cny, leverage_cny, total_pnl_cn
     if now.hour < 6:
         return
 
-    # Skip weekends — markets are closed, FX data can be unreliable at off-hours
-    if now.dayofweek >= 5:  # Saturday=5, Sunday=6
+    # Skip Sunday — no markets trade on Sunday.
+    # Saturday is kept: US markets close Friday 4PM ET = Saturday ~4AM Beijing time,
+    # so the Saturday snapshot captures Friday's closing prices.
+    if now.dayofweek == 6:  # Sunday
         return
 
     today = now.strftime('%Y-%m-%d')
@@ -1963,8 +1965,8 @@ def render_pnl_journal(df=None, fx=None):
 
     # Override today's entry with real-time position-based daily P&L
     # Skip weekends — markets closed, data is stale replay of Friday
-    _is_weekend = pd.Timestamp.now().dayofweek >= 5
-    if _rt_daily_pnl is not None and not _is_weekend:
+    _is_sunday = pd.Timestamp.now().dayofweek == 6
+    if _rt_daily_pnl is not None and not _is_sunday:
         _today_nav = pnl_lookup.get(_today_str, {}).get('nav')
         _today_cap = _cap_lookup.get(_today_str)
         if _today_nav is None and not snap_df.empty:
