@@ -179,7 +179,7 @@ def backup_db(keep_daily=7):
       - Keep the last `keep_daily` daily backups (default: 7)
       - Keep the 1st-of-month backup indefinitely (monthly archive)
     """
-    backup_dir = Path.home() / "Documents" / "investment-portfolio-backup"
+    backup_dir = Path.home() / "Documents" / "backup" / "investment-portfolio"
     backup_dir.mkdir(parents=True, exist_ok=True)
 
     src = Path(DB_PATH)
