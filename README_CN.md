@@ -97,15 +97,7 @@ fmp.py          — 行业分类（FMP / akshare / yfinance 多级回退）
 
 ## 参与贡献
 
-欢迎贡献代码！参与方式：
-
-1. Fork 本仓库
-2. 创建功能分支 (`git checkout -b feature/your-feature`)
-3. 提交更改 (`git commit -m 'Add some feature'`)
-4. 推送到分支 (`git push origin feature/your-feature`)
-5. 发起 Pull Request
-
-Bug 反馈和功能建议请 [提交 Issue](https://github.com/alanhewenyu/portfolio-tracker/issues)。
+欢迎贡献代码！Bug 反馈和功能建议请 [提交 Issue](https://github.com/alanhewenyu/portfolio-tracker/issues)，也欢迎直接提交 Pull Request。
 
 ## 许可证
 
