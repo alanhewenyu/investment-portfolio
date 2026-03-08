@@ -1705,61 +1705,8 @@ def render_performance(current_capital=None):
 # Risk Analytics
 # ────────────────────────────────────────
 
-def _compute_risk_metrics(snap, _periods_per_year):
-    """Compute risk metrics from a snap DataFrame that already has 'period_ret', 'pnl', 'cum_ret_idx', 'date_dt'.
-
-    Returns a dict of metric values, or None if insufficient data.
-    """
-    if len(snap) < 5:
-        return None
-
-    returns = snap['period_ret']
-
-    # Annualized volatility
-    period_vol = returns.std()
-    annual_vol = period_vol * (_periods_per_year ** 0.5)
-
-    # Max drawdown from cumulative return index
-    _cum_peak = snap['cum_ret_idx'].cummax()
-    drawdown = (snap['cum_ret_idx'] - _cum_peak) / _cum_peak
-    max_dd = drawdown.min()
-    _dd_end_idx = drawdown.idxmin()
-    _dd_end_date = snap.loc[_dd_end_idx, 'date']
-    _dd_end_pnl = snap.loc[_dd_end_idx, 'pnl']
-    _peak_idx = snap.loc[:_dd_end_idx, 'cum_ret_idx'].idxmax()
-    _dd_start_date = snap.loc[_peak_idx, 'date']
-    _dd_peak_pnl = snap.loc[_peak_idx, 'pnl']
-    _dd_pnl_lost = _dd_end_pnl - _dd_peak_pnl
-
-    # Sharpe (rf = 1.5% CNY)
-    rf = 0.015 / _periods_per_year
-    excess = returns.mean() - rf
-    sharpe = (excess / period_vol) * (_periods_per_year ** 0.5) if period_vol > 0 else 0
-
-    # Win rate
-    win = int((returns > 0).sum())
-    total = len(returns)
-    win_rate = win / total * 100
-
-    # Calmar
-    total_ret = snap['cum_ret_idx'].iloc[-1] / snap['cum_ret_idx'].iloc[0] - 1
-    days = (snap['date_dt'].iloc[-1] - snap['date_dt'].iloc[0]).days
-    years = days / 365.25
-    annual_ret = (1 + total_ret) ** (1 / years) - 1 if years > 0.1 else total_ret
-    calmar = abs(annual_ret / max_dd) if max_dd != 0 else 0
-
-    return dict(
-        annual_vol=annual_vol, period_vol=period_vol, max_dd=max_dd,
-        dd_start=_dd_start_date, dd_end=_dd_end_date,
-        dd_peak_pnl=_dd_peak_pnl, dd_end_pnl=_dd_end_pnl, dd_pnl_lost=_dd_pnl_lost,
-        sharpe=sharpe, win=win, total=total, win_rate=win_rate,
-        calmar=calmar, annual_ret=annual_ret, total_ret=total_ret,
-        n=total, days=days,
-    )
-
-
 def render_risk_analytics():
-    """Risk metrics using flow-adjusted returns with period selector.
+    """Risk metrics using flow-adjusted returns with rolling trend chart.
 
     Uses total_pnl_cny to compute returns that are independent of capital
     deposits/withdrawals.  Max drawdown is computed from the cumulative
@@ -1804,40 +1751,46 @@ def render_risk_analytics():
     else:
         _ppy = 12; _freq_label = '月频'
 
-    # ── Build cumulative return index on FULL data (needed for all period slices) ──
+    # ── Cumulative return index & drawdown ──
     snap['cum_ret_idx'] = (1 + snap['period_ret']).cumprod() * 100
+    _cum_peak = snap['cum_ret_idx'].cummax()
+    snap['drawdown_pct'] = (snap['cum_ret_idx'] - _cum_peak) / _cum_peak * 100  # %
 
-    # ── Period selector ──
+    # ── Rolling metrics ──
+    _window = max(_ppy // 4, 8)  # ~3 months of data; at least 8 periods
+    _min_p = max(_window // 2, 5)
+    _rf = 0.015 / _ppy
+    _roll_std = snap['period_ret'].rolling(_window, min_periods=_min_p).std()
+    snap['rolling_vol'] = _roll_std * (_ppy ** 0.5) * 100  # annualised %
+    snap['rolling_sharpe'] = (
+        (snap['period_ret'].rolling(_window, min_periods=_min_p).mean() - _rf) / _roll_std
+    ) * (_ppy ** 0.5)
+
+    # ── Whole-period KPI values ──
+    returns = snap['period_ret']
+    _period_vol = returns.std()
+    _annual_vol = _period_vol * (_ppy ** 0.5)
+    _max_dd = snap['drawdown_pct'].min() / 100  # as ratio
+    _dd_end_idx = snap['drawdown_pct'].idxmin()
+    _dd_end_date = snap.loc[_dd_end_idx, 'date']
+    _dd_end_pnl = snap.loc[_dd_end_idx, 'pnl']
+    _peak_idx = snap.loc[:_dd_end_idx, 'cum_ret_idx'].idxmax()
+    _dd_start_date = snap.loc[_peak_idx, 'date']
+    _dd_peak_pnl = snap.loc[_peak_idx, 'pnl']
+    _dd_pnl_lost = _dd_end_pnl - _dd_peak_pnl
+    _sharpe = ((returns.mean() - _rf) / _period_vol) * (_ppy ** 0.5) if _period_vol > 0 else 0
+    _win = int((returns > 0).sum())
+    _total = len(returns)
+    _win_rate = _win / _total * 100
+    _total_ret = snap['cum_ret_idx'].iloc[-1] / 100 - 1
+    _years = (snap['date_dt'].iloc[-1] - snap['date_dt'].iloc[0]).days / 365.25
+    _annual_ret = (1 + _total_ret) ** (1 / _years) - 1 if _years > 0.1 else _total_ret
+    _calmar = abs(_annual_ret / _max_dd) if _max_dd != 0 else 0
+
+    # ── Render section ──
     st.markdown('<div class="section-title">Risk Analytics</div>', unsafe_allow_html=True)
 
-    _period_opts = ['近3月', '近6月', '近1年', 'YTD', '全部']
-    _sel = st.radio('回看窗口', _period_opts, index=4, horizontal=True,
-                    key='risk_period', label_visibility='collapsed')
-
-    _now = snap['date_dt'].max()
-    if _sel == '近3月':
-        _cutoff = _now - pd.DateOffset(months=3)
-    elif _sel == '近6月':
-        _cutoff = _now - pd.DateOffset(months=6)
-    elif _sel == '近1年':
-        _cutoff = _now - pd.DateOffset(years=1)
-    elif _sel == 'YTD':
-        _cutoff = pd.Timestamp(f'{_now.year}-01-01')
-    else:
-        _cutoff = snap['date_dt'].min() - pd.Timedelta(days=1)
-
-    _sliced = snap[snap['date_dt'] >= _cutoff].copy()
-    # Re-index cum_ret_idx to start at 100 for the sliced period
-    if not _sliced.empty:
-        _base = _sliced['cum_ret_idx'].iloc[0]
-        _sliced['cum_ret_idx'] = _sliced['cum_ret_idx'] / _base * 100
-
-    m = _compute_risk_metrics(_sliced, _ppy)
-    if m is None:
-        st.caption(f'该时间段数据不足 (仅{len(_sliced)}条，需≥5条)')
-        return
-
-    # ── Render KPI cards ──
+    # ── KPI cards ──
     def _risk_card(label, value, sub='', color='var(--pf-text)'):
         return (
             f'<div style="text-align:center;padding:8px 4px;">'
@@ -1849,37 +1802,97 @@ def render_risk_analytics():
 
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
-        _vc = 'var(--pf-green)' if m['annual_vol'] < 0.15 else ('var(--pf-text)' if m['annual_vol'] < 0.25 else 'var(--pf-red)')
-        st.markdown(_risk_card('Ann. Volatility', f'{m["annual_vol"]:.1%}',
-                               f'{_freq_label} σ={m["period_vol"]:.2%}', _vc), unsafe_allow_html=True)
+        _vc = 'var(--pf-green)' if _annual_vol < 0.15 else ('var(--pf-text)' if _annual_vol < 0.25 else 'var(--pf-red)')
+        st.markdown(_risk_card('Ann. Volatility', f'{_annual_vol:.1%}',
+                               f'{_freq_label} σ={_period_vol:.2%}', _vc), unsafe_allow_html=True)
     with c2:
-        st.markdown(_risk_card('Max Drawdown', f'{m["max_dd"]:.1%}',
-                               f'¥{m["dd_pnl_lost"]:,.0f} · {m["dd_start"]}→{m["dd_end"]}', 'var(--pf-red)'), unsafe_allow_html=True)
+        st.markdown(_risk_card('Max Drawdown', f'{_max_dd:.1%}',
+                               f'¥{_dd_pnl_lost:,.0f} · {_dd_start_date}→{_dd_end_date}', 'var(--pf-red)'), unsafe_allow_html=True)
     with c3:
-        _sc = 'var(--pf-green)' if m['sharpe'] > 1 else ('var(--pf-text)' if m['sharpe'] > 0 else 'var(--pf-red)')
-        st.markdown(_risk_card('Sharpe Ratio', f'{m["sharpe"]:.2f}', 'rf=1.5% (CNY)', _sc), unsafe_allow_html=True)
+        _sc = 'var(--pf-green)' if _sharpe > 1 else ('var(--pf-text)' if _sharpe > 0 else 'var(--pf-red)')
+        st.markdown(_risk_card('Sharpe Ratio', f'{_sharpe:.2f}', 'rf=1.5% (CNY)', _sc), unsafe_allow_html=True)
     with c4:
-        _wc = 'var(--pf-green)' if m['win_rate'] > 50 else 'var(--pf-red)'
-        st.markdown(_risk_card('Win Rate', f'{m["win_rate"]:.0f}%',
-                               f'{m["win"]}W / {m["total"]-m["win"]}L ({_freq_label})', _wc), unsafe_allow_html=True)
+        _wc = 'var(--pf-green)' if _win_rate > 50 else 'var(--pf-red)'
+        st.markdown(_risk_card('Win Rate', f'{_win_rate:.0f}%',
+                               f'{_win}W / {_total-_win}L ({_freq_label})', _wc), unsafe_allow_html=True)
     with c5:
-        _cc = 'var(--pf-green)' if m['calmar'] > 1 else ('var(--pf-text)' if m['calmar'] > 0.5 else 'var(--pf-red)')
-        st.markdown(_risk_card('Calmar Ratio', f'{m["calmar"]:.2f}', f'ret={m["annual_ret"]:.1%}/yr', _cc), unsafe_allow_html=True)
+        _cc = 'var(--pf-green)' if _calmar > 1 else ('var(--pf-text)' if _calmar > 0.5 else 'var(--pf-red)')
+        st.markdown(_risk_card('Calmar Ratio', f'{_calmar:.2f}', f'ret={_annual_ret:.1%}/yr', _cc), unsafe_allow_html=True)
+
+    # ── Rolling trend chart (subplots: drawdown + rolling vol/Sharpe) ──
+    from plotly.subplots import make_subplots
+    _chart = snap.dropna(subset=['rolling_vol', 'rolling_sharpe']).copy()
+    if len(_chart) >= 3:
+        fig = make_subplots(
+            rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
+            row_heights=[0.4, 0.6],
+            specs=[[{}], [{'secondary_y': True}]],
+        )
+
+        # Row 1: Drawdown (filled area)
+        fig.add_trace(go.Scatter(
+            x=_chart['date'], y=_chart['drawdown_pct'],
+            name='Drawdown', fill='tozeroy',
+            line=dict(color='rgba(239,68,68,0.7)', width=1),
+            fillcolor='rgba(239,68,68,0.15)',
+            hovertemplate='%{x|%Y-%m-%d}<br>Drawdown: %{y:.1f}%<extra></extra>',
+        ), row=1, col=1)
+
+        # Row 2: Rolling Volatility (left Y)
+        fig.add_trace(go.Scatter(
+            x=_chart['date'], y=_chart['rolling_vol'],
+            name=f'Rolling Vol ({_window}期)',
+            line=dict(color='#f59e0b', width=1.5),
+            hovertemplate='%{x|%Y-%m-%d}<br>Ann. Vol: %{y:.1f}%<extra></extra>',
+        ), row=2, col=1, secondary_y=False)
+
+        # Row 2: Rolling Sharpe (right Y)
+        fig.add_trace(go.Scatter(
+            x=_chart['date'], y=_chart['rolling_sharpe'],
+            name=f'Rolling Sharpe ({_window}期)',
+            line=dict(color='#3b82f6', width=1.5),
+            hovertemplate='%{x|%Y-%m-%d}<br>Sharpe: %{y:.2f}<extra></extra>',
+        ), row=2, col=1, secondary_y=True)
+
+        # Reference lines
+        fig.add_hline(y=0, line=dict(color='rgba(150,150,150,0.3)', width=1), row=1, col=1)
+        fig.add_hline(y=1, line=dict(color='rgba(59,130,246,0.2)', width=1, dash='dot'),
+                      row=2, col=1, secondary_y=True)  # Sharpe = 1 reference
+
+        fig.update_yaxes(title_text='Drawdown %', row=1, col=1, ticksuffix='%',
+                         zeroline=False)
+        fig.update_yaxes(title_text='Ann. Vol %', row=2, col=1, secondary_y=False,
+                         ticksuffix='%', zeroline=False)
+        fig.update_yaxes(title_text='Sharpe', row=2, col=1, secondary_y=True,
+                         zeroline=False)
+
+        fig.update_layout(
+            height=340,
+            margin=dict(l=0, r=0, t=8, b=0),
+            plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)',
+            font=dict(size=11),
+            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5,
+                        font=dict(size=10)),
+            hovermode='x unified',
+        )
+        for ax in ['xaxis', 'xaxis2']:
+            fig.update_layout(**{ax: dict(showgrid=False)})
+        for ax in ['yaxis', 'yaxis2', 'yaxis3']:
+            fig.update_layout(**{ax: dict(gridcolor='rgba(150,150,150,0.1)')})
+
+        st.plotly_chart(fig, use_container_width=True)
 
     # ── Notes ──
-    _date_range = f'{_sliced["date"].iloc[0]} ~ {_sliced["date"].iloc[-1]}' if not _sliced.empty else ''
+    _date_range = f'{snap["date"].iloc[0]} ~ {snap["date"].iloc[-1]}'
     st.markdown(f'''<div style="font-size:11px; color:var(--pf-text2); font-family:var(--pf-mono);
-        margin-top:4px; margin-bottom:16px; line-height:1.7; opacity:0.75;">
-        * <b>{_sel}</b>: {m["n"]}条快照 ({_date_range})，
-          {_freq_label} (中位间隔{_median_gap:.0f}天)，年化因子 √{_ppy}<br>
-        * 收益率已<b>剔除出入金影响</b>: return = (PnL_t − PnL_prev) / (Capital_t + PnL_prev)<br>
-        * <b>年化波动率</b>: 收益率标准差 × √{_ppy}。
-          &lt;15% 低波动，15-25% 中等，&gt;25% 高波动<br>
-        * <b>最大回撤</b>: 累计收益指数从峰值到谷底的最大跌幅 (非单日亏损)。
-          期间累计盈亏从 ¥{m["dd_peak_pnl"]:,.0f} 降至 ¥{m["dd_end_pnl"]:,.0f}<br>
-        * <b>Sharpe</b>: (年化收益 − 1.5%) ÷ 年化波动率。
-          &gt;1 优秀，0.5-1 良好，&lt;0 亏损<br>
-        * <b>Calmar</b>: 年化收益 ÷ 最大回撤。&gt;1 说明年化收益能覆盖历史最大回撤
+        margin-top:-8px; margin-bottom:16px; line-height:1.7; opacity:0.75;">
+        * {_total}条快照 ({_date_range})，{_freq_label} (中位间隔{_median_gap:.0f}天)，
+          Rolling窗口={_window}期 ≈ {_window * _median_gap / 30:.0f}个月<br>
+        * 收益率已<b>剔除出入金影响</b>: return = ΔPnL / (Capital_t + PnL_prev)<br>
+        * <b>KPI卡片</b>: 全周期汇总值。<b>趋势图</b>: rolling {_window}期滚动计算，观察指标变化方向<br>
+        * <b>Drawdown</b>: 累计收益指数相对峰值的跌幅，0%=历史新高。
+          最大回撤 {_max_dd:.1%}，期间亏损 ¥{abs(_dd_pnl_lost):,.0f}<br>
+        * <b>Sharpe</b> 虚线=1.0 (优秀线)。&gt;1 每承担1单位风险获得&gt;1单位超额收益
     </div>''', unsafe_allow_html=True)
 
 
