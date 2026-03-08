@@ -1705,8 +1705,61 @@ def render_performance(current_capital=None):
 # Risk Analytics
 # ────────────────────────────────────────
 
+def _compute_risk_metrics(snap, _periods_per_year):
+    """Compute risk metrics from a snap DataFrame that already has 'period_ret', 'pnl', 'cum_ret_idx', 'date_dt'.
+
+    Returns a dict of metric values, or None if insufficient data.
+    """
+    if len(snap) < 5:
+        return None
+
+    returns = snap['period_ret']
+
+    # Annualized volatility
+    period_vol = returns.std()
+    annual_vol = period_vol * (_periods_per_year ** 0.5)
+
+    # Max drawdown from cumulative return index
+    _cum_peak = snap['cum_ret_idx'].cummax()
+    drawdown = (snap['cum_ret_idx'] - _cum_peak) / _cum_peak
+    max_dd = drawdown.min()
+    _dd_end_idx = drawdown.idxmin()
+    _dd_end_date = snap.loc[_dd_end_idx, 'date']
+    _dd_end_pnl = snap.loc[_dd_end_idx, 'pnl']
+    _peak_idx = snap.loc[:_dd_end_idx, 'cum_ret_idx'].idxmax()
+    _dd_start_date = snap.loc[_peak_idx, 'date']
+    _dd_peak_pnl = snap.loc[_peak_idx, 'pnl']
+    _dd_pnl_lost = _dd_end_pnl - _dd_peak_pnl
+
+    # Sharpe (rf = 1.5% CNY)
+    rf = 0.015 / _periods_per_year
+    excess = returns.mean() - rf
+    sharpe = (excess / period_vol) * (_periods_per_year ** 0.5) if period_vol > 0 else 0
+
+    # Win rate
+    win = int((returns > 0).sum())
+    total = len(returns)
+    win_rate = win / total * 100
+
+    # Calmar
+    total_ret = snap['cum_ret_idx'].iloc[-1] / snap['cum_ret_idx'].iloc[0] - 1
+    days = (snap['date_dt'].iloc[-1] - snap['date_dt'].iloc[0]).days
+    years = days / 365.25
+    annual_ret = (1 + total_ret) ** (1 / years) - 1 if years > 0.1 else total_ret
+    calmar = abs(annual_ret / max_dd) if max_dd != 0 else 0
+
+    return dict(
+        annual_vol=annual_vol, period_vol=period_vol, max_dd=max_dd,
+        dd_start=_dd_start_date, dd_end=_dd_end_date,
+        dd_peak_pnl=_dd_peak_pnl, dd_end_pnl=_dd_end_pnl, dd_pnl_lost=_dd_pnl_lost,
+        sharpe=sharpe, win=win, total=total, win_rate=win_rate,
+        calmar=calmar, annual_ret=annual_ret, total_ret=total_ret,
+        n=total, days=days,
+    )
+
+
 def render_risk_analytics():
-    """Risk metrics using flow-adjusted returns.
+    """Risk metrics using flow-adjusted returns with period selector.
 
     Uses total_pnl_cny to compute returns that are independent of capital
     deposits/withdrawals.  Max drawdown is computed from the cumulative
@@ -1727,79 +1780,64 @@ def render_risk_analytics():
     snap['pnl'] = snap['total_pnl_cny'].astype(float)
 
     # ── Flow-adjusted period returns ──
-    # return = P&L_change / (Capital_t + PnL_{t-1})
-    # This eliminates the effect of capital deposits/withdrawals.
-    snap['_gap_days'] = snap['date_dt'].diff().dt.days  # compute BEFORE dropna
+    snap['_gap_days'] = snap['date_dt'].diff().dt.days
     snap['pnl_prev'] = snap['pnl'].shift(1)
-    snap['adj_base'] = (snap['nav'] - snap['pnl']) + snap['pnl_prev']  # Capital_t + PnL_{t-1}
+    snap['adj_base'] = (snap['nav'] - snap['pnl']) + snap['pnl_prev']
     snap['pnl_chg'] = snap['pnl'] - snap['pnl_prev']
     snap = snap.dropna(subset=['pnl_chg', 'adj_base'])
-    snap = snap[snap['adj_base'].abs() > 1]  # guard: skip if denominator ~ 0
-    # Exclude extreme gaps (e.g. multi-year import jumps) that distort period returns
+    snap = snap[snap['adj_base'].abs() > 1]
     snap = snap[snap['_gap_days'] <= 90]
     snap['period_ret'] = snap['pnl_chg'] / snap['adj_base']
 
-    if len(snap) < 10:
+    if len(snap) < 5:
         return
 
-    returns = snap['period_ret']
-
-    # ── Auto-detect frequency from recent gaps (last 30 for faster adaptation) ──
+    # ── Auto-detect frequency ──
     _recent_gaps = snap['_gap_days'].dropna().tail(30)
     _median_gap = _recent_gaps.median() if not _recent_gaps.empty else 7
     if _median_gap <= 2:
-        _periods_per_year = 252    # daily
-        _freq_label = '日频'
+        _ppy = 252; _freq_label = '日频'
     elif _median_gap <= 8:
-        _periods_per_year = 52     # weekly
-        _freq_label = '周频'
+        _ppy = 52; _freq_label = '周频'
     elif _median_gap <= 16:
-        _periods_per_year = 26     # biweekly
-        _freq_label = '双周'
+        _ppy = 26; _freq_label = '双周'
     else:
-        _periods_per_year = 12     # monthly
-        _freq_label = '月频'
+        _ppy = 12; _freq_label = '月频'
 
-    # ── Annualized volatility ──
-    period_vol = returns.std()
-    annual_vol = period_vol * (_periods_per_year ** 0.5)
+    # ── Build cumulative return index on FULL data (needed for all period slices) ──
+    snap['cum_ret_idx'] = (1 + snap['period_ret']).cumprod() * 100
 
-    # ── Cumulative return index (for drawdown) ──
-    snap['cum_ret_idx'] = (1 + returns).cumprod() * 100
-
-    # ── Maximum drawdown from cumulative return index (not raw NAV!) ──
-    _cum_peak = snap['cum_ret_idx'].cummax()
-    drawdown = (snap['cum_ret_idx'] - _cum_peak) / _cum_peak
-    max_dd = drawdown.min()
-    _dd_end_idx = drawdown.idxmin()
-    _dd_end_date = snap.loc[_dd_end_idx, 'date']
-    _dd_end_pnl = snap.loc[_dd_end_idx, 'pnl']
-    # Find the peak that precedes the trough
-    _peak_idx = snap.loc[:_dd_end_idx, 'cum_ret_idx'].idxmax()
-    _dd_start_date = snap.loc[_peak_idx, 'date']
-    _dd_peak_pnl = snap.loc[_peak_idx, 'pnl']
-    _dd_pnl_lost = _dd_end_pnl - _dd_peak_pnl  # negative: P&L lost from peak to trough
-
-    # ── Sharpe ratio (annualized, risk-free = 1.5% for CNY) ──
-    rf_per_period = 0.015 / _periods_per_year
-    excess_ret = returns.mean() - rf_per_period
-    sharpe = (excess_ret / period_vol) * (_periods_per_year ** 0.5) if period_vol > 0 else 0
-
-    # ── Win rate ──
-    win_periods = (returns > 0).sum()
-    total_periods = len(returns)
-    win_rate = win_periods / total_periods * 100
-
-    # ── Calmar ratio (annualized return / max drawdown) ──
-    # Use cumulative return index for consistent total return
-    total_ret = snap['cum_ret_idx'].iloc[-1] / 100 - 1
-    years = (snap['date_dt'].iloc[-1] - snap['date_dt'].iloc[0]).days / 365.25
-    annual_ret = (1 + total_ret) ** (1 / years) - 1 if years > 0 else 0
-    calmar = abs(annual_ret / max_dd) if max_dd != 0 else 0
-
-    # ── Render ──
+    # ── Period selector ──
     st.markdown('<div class="section-title">Risk Analytics</div>', unsafe_allow_html=True)
 
+    _period_opts = ['近3月', '近6月', '近1年', 'YTD', '全部']
+    _sel = st.radio('回看窗口', _period_opts, index=4, horizontal=True,
+                    key='risk_period', label_visibility='collapsed')
+
+    _now = snap['date_dt'].max()
+    if _sel == '近3月':
+        _cutoff = _now - pd.DateOffset(months=3)
+    elif _sel == '近6月':
+        _cutoff = _now - pd.DateOffset(months=6)
+    elif _sel == '近1年':
+        _cutoff = _now - pd.DateOffset(years=1)
+    elif _sel == 'YTD':
+        _cutoff = pd.Timestamp(f'{_now.year}-01-01')
+    else:
+        _cutoff = snap['date_dt'].min() - pd.Timedelta(days=1)
+
+    _sliced = snap[snap['date_dt'] >= _cutoff].copy()
+    # Re-index cum_ret_idx to start at 100 for the sliced period
+    if not _sliced.empty:
+        _base = _sliced['cum_ret_idx'].iloc[0]
+        _sliced['cum_ret_idx'] = _sliced['cum_ret_idx'] / _base * 100
+
+    m = _compute_risk_metrics(_sliced, _ppy)
+    if m is None:
+        st.caption(f'该时间段数据不足 (仅{len(_sliced)}条，需≥5条)')
+        return
+
+    # ── Render KPI cards ──
     def _risk_card(label, value, sub='', color='var(--pf-text)'):
         return (
             f'<div style="text-align:center;padding:8px 4px;">'
@@ -1811,37 +1849,36 @@ def render_risk_analytics():
 
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
-        _vol_color = 'var(--pf-green)' if annual_vol < 0.15 else ('var(--pf-text)' if annual_vol < 0.25 else 'var(--pf-red)')
-        st.markdown(_risk_card('Ann. Volatility', f'{annual_vol:.1%}',
-                               f'{_freq_label} σ={period_vol:.2%}', _vol_color), unsafe_allow_html=True)
+        _vc = 'var(--pf-green)' if m['annual_vol'] < 0.15 else ('var(--pf-text)' if m['annual_vol'] < 0.25 else 'var(--pf-red)')
+        st.markdown(_risk_card('Ann. Volatility', f'{m["annual_vol"]:.1%}',
+                               f'{_freq_label} σ={m["period_vol"]:.2%}', _vc), unsafe_allow_html=True)
     with c2:
-        st.markdown(_risk_card('Max Drawdown', f'{max_dd:.1%}',
-                               f'¥{_dd_pnl_lost:,.0f} · {_dd_start_date}→{_dd_end_date}', 'var(--pf-red)'), unsafe_allow_html=True)
+        st.markdown(_risk_card('Max Drawdown', f'{m["max_dd"]:.1%}',
+                               f'¥{m["dd_pnl_lost"]:,.0f} · {m["dd_start"]}→{m["dd_end"]}', 'var(--pf-red)'), unsafe_allow_html=True)
     with c3:
-        _sh_color = 'var(--pf-green)' if sharpe > 1 else ('var(--pf-text)' if sharpe > 0 else 'var(--pf-red)')
-        st.markdown(_risk_card('Sharpe Ratio', f'{sharpe:.2f}', 'rf=1.5% (CNY)', _sh_color), unsafe_allow_html=True)
+        _sc = 'var(--pf-green)' if m['sharpe'] > 1 else ('var(--pf-text)' if m['sharpe'] > 0 else 'var(--pf-red)')
+        st.markdown(_risk_card('Sharpe Ratio', f'{m["sharpe"]:.2f}', 'rf=1.5% (CNY)', _sc), unsafe_allow_html=True)
     with c4:
-        _wr_color = 'var(--pf-green)' if win_rate > 50 else 'var(--pf-red)'
-        st.markdown(_risk_card('Win Rate', f'{win_rate:.0f}%',
-                               f'{win_periods}W / {total_periods - win_periods}L ({_freq_label})', _wr_color), unsafe_allow_html=True)
+        _wc = 'var(--pf-green)' if m['win_rate'] > 50 else 'var(--pf-red)'
+        st.markdown(_risk_card('Win Rate', f'{m["win_rate"]:.0f}%',
+                               f'{m["win"]}W / {m["total"]-m["win"]}L ({_freq_label})', _wc), unsafe_allow_html=True)
     with c5:
-        _cal_color = 'var(--pf-green)' if calmar > 1 else ('var(--pf-text)' if calmar > 0.5 else 'var(--pf-red)')
-        st.markdown(_risk_card('Calmar Ratio', f'{calmar:.2f}', f'ret={annual_ret:.1%}/yr', _cal_color), unsafe_allow_html=True)
+        _cc = 'var(--pf-green)' if m['calmar'] > 1 else ('var(--pf-text)' if m['calmar'] > 0.5 else 'var(--pf-red)')
+        st.markdown(_risk_card('Calmar Ratio', f'{m["calmar"]:.2f}', f'ret={m["annual_ret"]:.1%}/yr', _cc), unsafe_allow_html=True)
 
     # ── Notes ──
+    _date_range = f'{_sliced["date"].iloc[0]} ~ {_sliced["date"].iloc[-1]}' if not _sliced.empty else ''
     st.markdown(f'''<div style="font-size:11px; color:var(--pf-text2); font-family:var(--pf-mono);
         margin-top:4px; margin-bottom:16px; line-height:1.7; opacity:0.75;">
-        * 数据源: {len(snap)}条快照 ({snap_df['date'].min()} ~ {snap_df['date'].max()})，
-          检测为<b>{_freq_label}</b>数据 (近30期中位间隔{_median_gap:.0f}天)，年化因子 √{_periods_per_year}<br>
-        * 收益率已<b>剔除出入金影响</b>: return = (PnL_t − PnL_prev) / (Capital_t + PnL_prev)，
-          仅反映投资损益<br>
-        * <b>年化波动率</b>: 收益率标准差 × √{_periods_per_year}，衡量组合净值的波动幅度。
+        * <b>{_sel}</b>: {m["n"]}条快照 ({_date_range})，
+          {_freq_label} (中位间隔{_median_gap:.0f}天)，年化因子 √{_ppy}<br>
+        * 收益率已<b>剔除出入金影响</b>: return = (PnL_t − PnL_prev) / (Capital_t + PnL_prev)<br>
+        * <b>年化波动率</b>: 收益率标准差 × √{_ppy}。
           &lt;15% 低波动，15-25% 中等，&gt;25% 高波动<br>
-        * <b>最大回撤</b>: 累计收益指数从峰值到谷底的最大跌幅 (非单日亏损，非净资产变动)。
-          期间累计盈亏从 ¥{_dd_peak_pnl:,.0f} 降至 ¥{_dd_end_pnl:,.0f}，亏损 ¥{abs(_dd_pnl_lost):,.0f}<br>
-        * <b>Sharpe</b>: (年化收益 − 无风险利率1.5%) ÷ 年化波动率。
+        * <b>最大回撤</b>: 累计收益指数从峰值到谷底的最大跌幅 (非单日亏损)。
+          期间累计盈亏从 ¥{m["dd_peak_pnl"]:,.0f} 降至 ¥{m["dd_end_pnl"]:,.0f}<br>
+        * <b>Sharpe</b>: (年化收益 − 1.5%) ÷ 年化波动率。
           &gt;1 优秀，0.5-1 良好，&lt;0 亏损<br>
-        * <b>胜率</b>: 快照周期内收益为正的比例。&gt;50% 说明多数周期在赚钱<br>
         * <b>Calmar</b>: 年化收益 ÷ 最大回撤。&gt;1 说明年化收益能覆盖历史最大回撤
     </div>''', unsafe_allow_html=True)
 
