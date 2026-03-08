@@ -78,7 +78,7 @@ Streamlit-based personal investment portfolio tracker.
 - [ ] Rebalance reminders (deviation from target allocation)
 
 #### 2.8 Deployment & Mobile
-- [ ] Auto-backup SQLite to iCloud/NAS
+- [x] Auto-backup SQLite to iCloud (~/Documents, via snapshot.py cron)
 - [ ] Mobile-responsive CSS refinement for KPI cards & table
 - [ ] Deploy to VPS + Cloudflare Tunnel for remote access
 

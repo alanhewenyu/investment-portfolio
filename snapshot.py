@@ -13,10 +13,12 @@ Cron (run at 06:00 Beijing time every day):
 """
 
 import json
+import shutil
 import sys
 import os
 import sqlite3
 from datetime import datetime
+from pathlib import Path
 
 # Ensure project dir is on path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -168,6 +170,66 @@ def take_snapshot(dry_run=False):
     }
 
 
+def backup_db(keep_daily=7):
+    """Backup portfolio.db to ~/Documents/investment-portfolio-backup/.
+
+    ~/Documents is synced to iCloud on macOS, providing automatic cloud backup.
+
+    Retention policy:
+      - Keep the last `keep_daily` daily backups (default: 7)
+      - Keep the 1st-of-month backup indefinitely (monthly archive)
+    """
+    backup_dir = Path.home() / "Documents" / "investment-portfolio-backup"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+
+    src = Path(DB_PATH)
+    if not src.exists():
+        print(f"  WARN: DB not found at {src}, skipping backup")
+        return
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    dst = backup_dir / f"portfolio_{today}.db"
+
+    # Use sqlite3 backup API for a safe, consistent copy (no corruption risk)
+    src_conn = sqlite3.connect(str(src))
+    dst_conn = sqlite3.connect(str(dst))
+    try:
+        src_conn.backup(dst_conn)
+        dst_conn.close()
+        src_conn.close()
+        size_mb = dst.stat().st_size / (1024 * 1024)
+        print(f"✓ Backup saved: {dst}  ({size_mb:.1f} MB)")
+    except Exception as e:
+        dst_conn.close()
+        src_conn.close()
+        print(f"  WARN: backup failed: {e}")
+        return
+
+    # Also maintain a "latest" symlink / copy for easy restore
+    latest = backup_dir / "portfolio_latest.db"
+    shutil.copy2(str(dst), str(latest))
+
+    # ── Retention: prune old daily backups, keep monthly (1st of month) ──
+    backups = sorted(backup_dir.glob("portfolio_????-??-??.db"))
+    for f in backups:
+        name = f.stem  # portfolio_2026-03-08
+        date_str = name.replace("portfolio_", "")
+        try:
+            dt = datetime.strptime(date_str, "%Y-%m-%d")
+        except ValueError:
+            continue
+        # Keep monthly archives (1st of month) indefinitely
+        if dt.day == 1:
+            continue
+        # Keep recent daily backups
+        age = (datetime.now() - dt).days
+        if age > keep_daily:
+            f.unlink()
+            print(f"  Pruned old backup: {f.name}")
+
+
 if __name__ == "__main__":
     dry = "--dry-run" in sys.argv
     take_snapshot(dry_run=dry)
+    if not dry:
+        backup_db()
