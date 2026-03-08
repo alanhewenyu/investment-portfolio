@@ -97,7 +97,11 @@ fmp.py          — Industry classification (FMP / akshare / yfinance fallback)
 
 ## Contributing
 
-Contributions are welcome! Feel free to [open an issue](https://github.com/alanhewenyu/portfolio-tracker/issues) or submit a pull request.
+Contributions are welcome! Feel free to [open an issue](https://github.com/alanhewenyu/portfolio-tracker/issues) or submit a pull request. Contact: [alanhe@icloud.com](mailto:alanhe@icloud.com)
+
+Scan to follow on WeChat:
+
+<img src="https://jianshan.co/images/wechat-qrcode.jpg" alt="见山笔记 WeChat QR Code" width="200">
 
 ## License
 

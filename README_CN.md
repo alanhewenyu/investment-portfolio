@@ -97,7 +97,11 @@ fmp.py          — 行业分类（FMP / akshare / yfinance 多级回退）
 
 ## 参与贡献
 
-欢迎贡献代码！Bug 反馈和功能建议请 [提交 Issue](https://github.com/alanhewenyu/portfolio-tracker/issues)，也欢迎直接提交 Pull Request。
+欢迎贡献代码！Bug 反馈和功能建议请 [提交 Issue](https://github.com/alanhewenyu/portfolio-tracker/issues)，也欢迎直接提交 Pull Request。联系邮箱：[alanhe@icloud.com](mailto:alanhe@icloud.com)
+
+关注微信公众号：
+
+<img src="https://jianshan.co/images/wechat-qrcode.jpg" alt="见山笔记 微信公众号" width="200">
 
 ## 许可证
 
