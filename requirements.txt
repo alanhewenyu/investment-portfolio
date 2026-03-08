@@ -1,0 +1,7 @@
+streamlit>=1.30
+pandas
+openpyxl
+yfinance
+plotly
+requests
+python-dotenv

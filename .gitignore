@@ -1,0 +1,32 @@
+# Database & data
+*.db
+*.db-wal
+*.db-shm
+
+# Logs
+*.log
+
+# Excel data files
+*.xlsx
+*.xlsm
+*.xls
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Environment & config
+.env
+config.yaml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE & tools
+.vscode/
+.idea/
+.claude/
