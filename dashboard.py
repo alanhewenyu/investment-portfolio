@@ -1647,8 +1647,8 @@ def render_performance(current_capital=None):
             )
         if _alpha_parts:
             _alpha_html = (
-                '<div style="text-align:center;font-size:11px;font-family:var(--pf-mono);'
-                'color:var(--pf-text2);margin-top:-8px;margin-bottom:8px;">'
+                '<div style="font-size:11px;font-family:var(--pf-mono);'
+                'color:var(--pf-text2);margin-top:-8px;margin-bottom:24px;">'
                 f'Alpha (excess return): {"".join(_alpha_parts)}'
                 '</div>'
             )
