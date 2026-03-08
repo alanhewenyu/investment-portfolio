@@ -1715,38 +1715,55 @@ def render_risk_analytics():
     snap['date_dt'] = pd.to_datetime(snap['date'])
     snap['nav'] = snap['net_assets'].astype(float)
 
-    # Daily returns (log returns for better statistical properties)
-    snap['daily_ret'] = snap['nav'].pct_change()
-    snap = snap.dropna(subset=['daily_ret'])
+    # Auto-detect snapshot frequency from median gap (days between snapshots)
+    _gaps = snap['date_dt'].diff().dt.days.dropna()
+    _median_gap = _gaps.median() if not _gaps.empty else 7
+    if _median_gap <= 2:
+        _periods_per_year = 252    # daily
+        _freq_label = '日频'
+    elif _median_gap <= 8:
+        _periods_per_year = 52     # weekly
+        _freq_label = '周频'
+    elif _median_gap <= 16:
+        _periods_per_year = 26     # biweekly
+        _freq_label = '双周'
+    else:
+        _periods_per_year = 12     # monthly
+        _freq_label = '月频'
+
+    # Period returns (not necessarily daily — depends on snapshot frequency)
+    snap['period_ret'] = snap['nav'].pct_change()
+    snap = snap.dropna(subset=['period_ret'])
     if len(snap) < 10:
         return
 
-    returns = snap['daily_ret']
+    returns = snap['period_ret']
 
     # ── Annualized volatility ──
-    daily_vol = returns.std()
-    annual_vol = daily_vol * (252 ** 0.5)  # annualize
+    period_vol = returns.std()
+    annual_vol = period_vol * (_periods_per_year ** 0.5)
 
-    # ── Maximum drawdown ──
+    # ── Maximum drawdown (peak-to-trough) ──
     cummax = snap['nav'].cummax()
     drawdown = (snap['nav'] - cummax) / cummax
     max_dd = drawdown.min()  # most negative = worst drawdown
-    # Drawdown duration
     _dd_end_idx = drawdown.idxmin()
     _dd_end_date = snap.loc[_dd_end_idx, 'date']
+    _dd_trough_nav = snap.loc[_dd_end_idx, 'nav']
     _peak_nav = cummax.loc[_dd_end_idx]
+    _dd_amount = _dd_trough_nav - _peak_nav  # negative number
     _peak_mask = (snap['nav'] == _peak_nav) & (snap.index <= _dd_end_idx)
     _dd_start_date = snap.loc[_peak_mask.idxmax(), 'date'] if _peak_mask.any() else _dd_end_date
 
     # ── Sharpe ratio (annualized, risk-free = 1.5% for CNY) ──
-    rf_daily = 0.015 / 252
-    excess_ret = returns.mean() - rf_daily
-    sharpe = (excess_ret / daily_vol) * (252 ** 0.5) if daily_vol > 0 else 0
+    rf_per_period = 0.015 / _periods_per_year
+    excess_ret = returns.mean() - rf_per_period
+    sharpe = (excess_ret / period_vol) * (_periods_per_year ** 0.5) if period_vol > 0 else 0
 
     # ── Win rate ──
-    win_days = (returns > 0).sum()
-    total_days = len(returns)
-    win_rate = win_days / total_days * 100
+    win_periods = (returns > 0).sum()
+    total_periods = len(returns)
+    win_rate = win_periods / total_periods * 100
 
     # ── Calmar ratio (annualized return / max drawdown) ──
     total_ret = snap['nav'].iloc[-1] / snap['nav'].iloc[0] - 1
@@ -1769,18 +1786,36 @@ def render_risk_analytics():
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
         _vol_color = 'var(--pf-green)' if annual_vol < 0.15 else ('var(--pf-text)' if annual_vol < 0.25 else 'var(--pf-red)')
-        st.markdown(_risk_card('Ann. Volatility', f'{annual_vol:.1%}', f'daily σ={daily_vol:.2%}', _vol_color), unsafe_allow_html=True)
+        st.markdown(_risk_card('Ann. Volatility', f'{annual_vol:.1%}',
+                               f'{_freq_label} σ={period_vol:.2%}', _vol_color), unsafe_allow_html=True)
     with c2:
-        st.markdown(_risk_card('Max Drawdown', f'{max_dd:.1%}', f'{_dd_start_date}→{_dd_end_date}', 'var(--pf-red)'), unsafe_allow_html=True)
+        st.markdown(_risk_card('Max Drawdown', f'{max_dd:.1%}',
+                               f'¥{_dd_amount:,.0f} · {_dd_start_date}→{_dd_end_date}', 'var(--pf-red)'), unsafe_allow_html=True)
     with c3:
         _sh_color = 'var(--pf-green)' if sharpe > 1 else ('var(--pf-text)' if sharpe > 0 else 'var(--pf-red)')
         st.markdown(_risk_card('Sharpe Ratio', f'{sharpe:.2f}', 'rf=1.5% (CNY)', _sh_color), unsafe_allow_html=True)
     with c4:
         _wr_color = 'var(--pf-green)' if win_rate > 50 else 'var(--pf-red)'
-        st.markdown(_risk_card('Win Rate', f'{win_rate:.0f}%', f'{win_days}W / {total_days - win_days}L', _wr_color), unsafe_allow_html=True)
+        st.markdown(_risk_card('Win Rate', f'{win_rate:.0f}%',
+                               f'{win_periods}W / {total_periods - win_periods}L ({_freq_label})', _wr_color), unsafe_allow_html=True)
     with c5:
         _cal_color = 'var(--pf-green)' if calmar > 1 else ('var(--pf-text)' if calmar > 0.5 else 'var(--pf-red)')
         st.markdown(_risk_card('Calmar Ratio', f'{calmar:.2f}', f'ret={annual_ret:.1%}/yr', _cal_color), unsafe_allow_html=True)
+
+    # ── Notes ──
+    st.markdown(f'''<div style="font-size:11px; color:var(--pf-text2); font-family:var(--pf-mono);
+        margin-top:4px; margin-bottom:16px; line-height:1.7; opacity:0.75;">
+        * 数据源: {len(snap)+1}条快照 ({snap_df['date'].min()} ~ {snap_df['date'].max()})，
+          检测为<b>{_freq_label}</b>数据 (中位间隔{_median_gap:.0f}天)，年化因子 √{_periods_per_year}<br>
+        * <b>年化波动率</b>: 收益率标准差 × √{_periods_per_year}，衡量组合净值的波动幅度。
+          &lt;15% 低波动，15-25% 中等，&gt;25% 高波动<br>
+        * <b>最大回撤</b>: 从历史最高点到最低点的最大跌幅 (峰值→谷底，非单日亏损)。
+          ¥{_peak_nav:,.0f} → ¥{_dd_trough_nav:,.0f}，累计跌 ¥{abs(_dd_amount):,.0f}<br>
+        * <b>Sharpe</b>: (年化收益 − 无风险利率) ÷ 年化波动率，衡量每承担一单位风险获得的超额回报。
+          &gt;1 优秀，0.5-1 良好，&lt;0 亏损<br>
+        * <b>胜率</b>: 快照周期内净值上涨的比例。&gt;50% 说明多数周期在赚钱<br>
+        * <b>Calmar</b>: 年化收益 ÷ 最大回撤，衡量收益与极端风险的比值。&gt;1 说明收益能覆盖最大回撤
+    </div>''', unsafe_allow_html=True)
 
 
 # ────────────────────────────────────────
