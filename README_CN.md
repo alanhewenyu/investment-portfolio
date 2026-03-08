@@ -4,6 +4,8 @@
 
 基于 Streamlit 的投资组合仪表盘，支持多券商、多币种持仓追踪，实时行情、风险分析与自动备份。
 
+![Dashboard Screenshot](docs/screenshot.png)
+
 ## 功能特性
 
 - **多券商** — 同时管理多个券商账户（富途、中信、招商、盈透等）
@@ -92,6 +94,18 @@ fmp.py          — 行业分类（FMP / akshare / yfinance 多级回退）
 - **行情**：yfinance、天天基金 API
 - **汇率**：Yahoo Finance + exchangerate.host 备用
 - **行业**：akshare + yfinance（免费），可选 FMP API
+
+## 参与贡献
+
+欢迎贡献代码！参与方式：
+
+1. Fork 本仓库
+2. 创建功能分支 (`git checkout -b feature/your-feature`)
+3. 提交更改 (`git commit -m 'Add some feature'`)
+4. 推送到分支 (`git push origin feature/your-feature`)
+5. 发起 Pull Request
+
+Bug 反馈和功能建议请 [提交 Issue](https://github.com/alanhewenyu/portfolio-tracker/issues)。
 
 ## 许可证
 

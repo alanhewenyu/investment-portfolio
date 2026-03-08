@@ -4,6 +4,8 @@
 
 A Streamlit-based investment portfolio dashboard for tracking multi-broker, multi-currency holdings with real-time pricing, risk analytics, and automated backups.
 
+![Dashboard Screenshot](docs/screenshot.png)
+
 ## Features
 
 - **Multi-Broker** — Track positions across any number of brokers (e.g. Futu, CITIC, Robinhood, Interactive Brokers)
@@ -92,6 +94,18 @@ fmp.py          — Industry classification (FMP / akshare / yfinance fallback)
 - **Prices**: yfinance, Tiantian Fund API
 - **FX**: Yahoo Finance + exchangerate.host fallback
 - **Industry**: akshare + yfinance (free), optional FMP API
+
+## Contributing
+
+Contributions are welcome! To get started:
+
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/your-feature`)
+3. Make your changes and commit (`git commit -m 'Add some feature'`)
+4. Push to the branch (`git push origin feature/your-feature`)
+5. Open a Pull Request
+
+For bug reports and feature requests, please [open an issue](https://github.com/alanhewenyu/portfolio-tracker/issues).
 
 ## License
 
