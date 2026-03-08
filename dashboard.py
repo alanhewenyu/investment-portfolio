@@ -882,6 +882,10 @@ def _record_snapshot(net_assets, equity_mv, cash_cny, leverage_cny, total_pnl_cn
     if now.hour < 6:
         return
 
+    # Skip weekends — markets are closed, FX data can be unreliable at off-hours
+    if now.dayofweek >= 5:  # Saturday=5, Sunday=6
+        return
+
     today = now.strftime('%Y-%m-%d')
     total_assets = equity_mv + cash_cny  # 资产总值 = 权益 + 现金
     try:

@@ -329,6 +329,15 @@ def get_fx_rates():
     _updated = []
     for cur, live in zip(_fx_currencies, _fx_results):
         if live:
+            # Sanity check: reject live rate if >50% away from DB fallback
+            db_rate = rates.get(cur)
+            if db_rate and db_rate > 0:
+                deviation = abs(live - db_rate) / db_rate
+                if deviation > 0.5:
+                    import sys
+                    print(f"  FX sanity check REJECTED {cur}: live={live:.6f} "
+                          f"vs db={db_rate:.6f} (deviation={deviation:.0%})", file=sys.stderr)
+                    continue  # keep DB fallback
             rates[cur] = live
             _updated.append((cur, live))
 
