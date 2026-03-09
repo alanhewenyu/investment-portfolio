@@ -33,6 +33,11 @@ def _fmt(val):
 
 def take_snapshot(dry_run=False):
     """Fetch all prices, compute NAV, write snapshot."""
+    # Skip Sun/Mon — US market closed Sat/Sun, Beijing time is +1 day
+    # Tue–Sat snapshots at 6am capture Mon–Fri US close (trading_date = snapshot − 1)
+    if datetime.now().weekday() in (6, 0):  # 6=Sun, 0=Mon
+        print(f"[{datetime.now():%Y-%m-%d %H:%M}] No trading day (Sun/Mon), skipping.")
+        return None
     init_db()
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"\n{'='*55}")

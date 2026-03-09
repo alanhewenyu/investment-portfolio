@@ -82,10 +82,23 @@ def _fetch_ashare_domestic(ticker: str) -> tuple[float, str, float | None]:
     return (price, 'CNY', prev_close)
 
 
+def _is_b_share(ticker: str) -> bool:
+    """Check if ticker is a B-share (traded in USD on SSE or HKD on SZSE)."""
+    if not ticker:
+        return False
+    code = ticker.split('.')[0]
+    # Shanghai B: 900xxx, Shenzhen B: 200xxx
+    return (ticker.endswith('.SS') and code.startswith('900')) or \
+           (ticker.endswith('.SZ') and code.startswith('200'))
+
+
 def _infer_currency(ticker: str) -> str | None:
     """Infer trading currency from ticker suffix (best-effort)."""
     if not ticker:
         return None
+    if _is_b_share(ticker):
+        code = ticker.split('.')[0]
+        return 'USD' if code.startswith('900') else 'HKD'  # SSE B=USD, SZSE B=HKD
     if ticker.endswith('.SS') or ticker.endswith('.SZ'):
         return 'CNY'
     if ticker.endswith('.HK'):
@@ -232,7 +245,8 @@ def fetch_price(ticker: str, regular_only: bool = False) -> tuple[float | None, 
     else:
         currency = _infer_currency(ticker)
 
-        # A-share tickers: try domestic API first (faster, more reliable), yfinance as fallback
+        # A-share tickers (not B-share): try domestic API first (faster, more reliable), yfinance as fallback
+        # B-shares (900xxx.SS, 200xxx.SZ) skip domestic API — eastmoney returns CNY-converted price, not actual USD/HKD
         if currency == 'CNY' and (ticker.endswith('.SS') or ticker.endswith('.SZ')):
             try:
                 result = _retry(lambda: _fetch_ashare_domestic(ticker))

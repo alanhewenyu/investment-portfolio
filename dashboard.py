@@ -2192,7 +2192,8 @@ def render_pnl_journal(df=None, fx=None):
             _rt_daily_pnl = _dp_total
             _rt_daily_pnl_pct = (_dp_total / _dp_base * 100) if _dp_base != 0 else 0
 
-    if snap_df.empty or len(snap_df) < 2:
+    snap_full = pd.DataFrame()  # full journal (includes rows without delta)
+    if snap_df.empty:
         if _rt_daily_pnl is None:
             return
         snap = pd.DataFrame()
@@ -2212,14 +2213,17 @@ def render_pnl_journal(df=None, fx=None):
         snap['daily_pnl_pct'] = (snap['daily_pnl'] / snap['prev_nav'] * 100)
         # Gap days between consecutive snapshots
         snap['gap_days'] = (snap['date_dt'] - snap['date_dt'].shift(1)).dt.days
-        # Trading date = snapshot date − 1 (6 AM snapshot captures yesterday's close)
+        # Trading date = snapshot date − 1 (6 AM Beijing snapshot captures previous day's close)
+        # Sat→Fri, Tue→Mon, Wed→Tue, etc. Sun/Mon snapshots shouldn't exist.
         snap['trading_date_dt'] = snap['date_dt'] - pd.Timedelta(days=1)
         snap['trading_date'] = snap['trading_date_dt'].dt.strftime('%Y-%m-%d')
+        # Keep full snap for journal (may have NaN deltas for first entry)
+        snap_full = snap.copy()
         snap = snap.dropna(subset=['daily_pnl'])
         # Drop rows where trading date falls on a weekend (no real trading)
         snap = snap[snap['trading_date_dt'].dt.dayofweek < 5]
 
-        if snap.empty and _rt_daily_pnl is None:
+        if snap.empty and snap_full.empty and _rt_daily_pnl is None:
             return
 
         # Build lookup: trading_date_str → {pnl, pnl_pct, nav, capital, net_pnl, gap_days}
@@ -2369,9 +2373,10 @@ def render_pnl_journal(df=None, fx=None):
     st.markdown(html, unsafe_allow_html=True)
 
     # ── Journal table (expandable) — last 30 days only ──
-    if not snap.empty:
+    _journal_src = snap_full if not snap_full.empty else snap
+    if not _journal_src.empty:
         _30d_ago = (pd.Timestamp.now() - pd.Timedelta(days=30)).strftime('%Y-%m-%d')
-        journal = snap[snap['trading_date'] >= _30d_ago].sort_values('trading_date', ascending=False).copy()
+        journal = _journal_src[_journal_src['trading_date'] >= _30d_ago].sort_values('trading_date', ascending=False).copy()
         if journal.empty:
             return
         with st.expander(f"Net P&L Journal (last 30 days · {len(journal)} entries)", expanded=False):
@@ -2384,10 +2389,11 @@ def render_pnl_journal(df=None, fx=None):
 
             for _, r in journal.iterrows():
                 _d = r['trading_date']
-                pnl = r['daily_pnl']
-                pct = r['daily_pnl_pct']
-                cls = _pnl_class(pnl)
-                sign = '+' if pnl >= 0 else ''
+                pnl = r.get('daily_pnl')
+                pct = r.get('daily_pnl_pct')
+                _has_delta = pd.notna(pnl)
+                cls = _pnl_class(pnl) if _has_delta else ''
+                sign = ('+' if pnl >= 0 else '') if _has_delta else ''
                 _cap = r.get('capital')
                 _net = r.get('net_pnl')
                 _net_cls = _pnl_class(_net) if pd.notna(_net) else ''
@@ -2396,8 +2402,8 @@ def render_pnl_journal(df=None, fx=None):
                 jhtml += f'<td>¥{r["net_assets"]:,.0f}</td>'
                 jhtml += f'<td>{"¥" + _fmt(_cap) if pd.notna(_cap) else "—"}</td>'
                 jhtml += f'<td class="{_net_cls}">{"¥" + _pnl_sign(_net) if pd.notna(_net) else "—"}</td>'
-                jhtml += f'<td class="{cls}">{sign}{pnl:,.0f}</td>'
-                jhtml += f'<td class="{cls}">{sign}{pct:.2f}%</td>'
+                jhtml += f'<td class="{cls}">{sign}{pnl:,.0f}</td>' if _has_delta else '<td>—</td>'
+                jhtml += f'<td class="{cls}">{sign}{pct:.2f}%</td>' if _has_delta else '<td>—</td>'
                 jhtml += '</tr>'
 
             jhtml += '</tbody></table>'
@@ -3051,7 +3057,7 @@ def main():
             − Realized({_pnl_sign(_realized_pnl)})
             = <b class="{_fx_cls}">¥{_pnl_sign(_forex_gl)}</b>'''
 
-        # ── 富途 account-level breakdown (only when 富途 is a deposit broker) ──
+        # ── 富途 account-level breakdown (only for portfolios with 富途 as deposit broker) ──
         if '富途' in DEPOSIT_BROKERS and FUTU_DEPOSIT_FX > 0:
             _futu_fx_impact = FUTU_CAPITAL / FUTU_DEPOSIT_FX * fx.get('USD', 1.0) - FUTU_CAPITAL
             _futu_fx_cls = _pnl_class(_futu_fx_impact)
