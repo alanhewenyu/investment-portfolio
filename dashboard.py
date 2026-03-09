@@ -14,7 +14,7 @@ from db import (DB_PATH, get_conn, init_db, upsert_position, upsert_snapshot,
                 upsert_cash, upsert_margin, insert_closed_trade,
                 compute_capital, FUTU_CAPITAL, FUTU_DEPOSIT_FX, B_SHARE_CAPITAL,
                 DEPOSIT_MODE, DEPOSIT_BROKERS, get_ytd_baselines, record_ytd_baselines,
-                PORTFOLIOS, set_active_portfolio)
+                PORTFOLIOS, set_active_portfolio, get_dcf_valuations)
 from prices import fetch_price, get_fx_rates, prefetch_all, get_previous_close
 from fmp import fetch_all_industries
 
@@ -493,6 +493,27 @@ def build_portfolio(fx_tuple=None):
 
     total_mv = df['market_value_cny'].sum()
     df['weight'] = df['market_value_cny'] / total_mv * 100 if total_mv > 0 else 0
+
+    # DCF valuation from ValuX-DB (read-only, latest per ticker)
+    dcf_map = get_dcf_valuations()
+    dcf_prices = []
+    dcf_dates = []
+    mos_pcts = []
+    for _, row in df.iterrows():
+        dcf = dcf_map.get(row['ticker'])
+        if dcf:
+            dp = dcf['dcf_price']
+            dcf_prices.append(dp)
+            dcf_dates.append(dcf['date'])
+            p = row['price']
+            mos_pcts.append((dp - p) / dp * 100 if dp > 0 else None)
+        else:
+            dcf_prices.append(None)
+            dcf_dates.append(None)
+            mos_pcts.append(None)
+    df['dcf_price'] = dcf_prices
+    df['dcf_date'] = dcf_dates
+    df['mos_pct'] = mos_pcts
 
     return df
 
@@ -1238,6 +1259,8 @@ def render_holdings(df, fx):
     html += '<th class="num" title="Baseline: 2026-03-06 Close · Denominator: avg(baseline cost, current cost)">YTD P&L%</th>'
     html += '<th class="num">Total P&L</th>'
     html += '<th class="num">Total P&L %</th>'
+    html += '<th class="num" title="DCF intrinsic value (ValuX)">DCF</th>'
+    html += '<th class="num" title="Margin of Safety = (DCF − Price) / DCF">MoS%</th>'
     html += '<th class="num">Wt%</th>'
     html += '</tr>'
 
@@ -1274,6 +1297,8 @@ def render_holdings(df, fx):
     html += '<th class="sub num">CNY</th>'
     html += '<th class="sub num"></th>'
     html += '<th class="sub num">CNY</th>'
+    html += '<th class="sub num"></th>'
+    html += '<th class="sub num">original</th>'
     html += '<th class="sub num"></th>'
     html += '<th class="sub num"></th>'
     html += '</tr></thead>'
@@ -1350,6 +1375,20 @@ def render_holdings(df, fx):
         html += _pnl_td(r.get('ytd_pnl_pct'), decimals=1, is_pct=True)
         html += _pnl_td(pnl_cny)
         html += _pnl_td(r['pnl_pct'], decimals=1, is_pct=True)
+        # DCF + MoS%
+        _dcf = r.get('dcf_price')
+        _mos = r.get('mos_pct')
+        _dcf_dt = r.get('dcf_date', '')
+        if _dcf is not None and not pd.isna(_dcf):
+            html += f'<td class="num" title="{_dcf_dt}">{_dcf:,.2f}</td>'
+            if _mos is not None and not pd.isna(_mos):
+                _mos_cls = 'up' if _mos > 0 else 'dn' if _mos < 0 else ''
+                _mos_sign = '+' if _mos > 0 else ''
+                html += f'<td class="num {_mos_cls}">{_mos_sign}{_mos:.1f}%</td>'
+            else:
+                html += '<td class="num">—</td>'
+        else:
+            html += '<td class="num">—</td><td class="num">—</td>'
         html += f'<td class="num">{r["weight"]:.1f}%</td>'
         html += '</tr>'
 
@@ -1396,6 +1435,7 @@ def render_holdings(df, fx):
     html += f'<td class="num {pnl_cls}"><b>{pnl_sign}{t_pnl_cny:,.0f}</b></td>'
     pp_sign = '+' if pnl_pct_total > 0 else ''
     html += f'<td class="num {pnl_cls}"><b>{pp_sign}{pnl_pct_total:.1f}%</b></td>'
+    html += '<td class="num"></td><td class="num"></td>'  # DCF, MoS%
     html += f'<td class="num"><b>{t_wt:.1f}%</b></td>'
     html += '</tr></tfoot>'
 

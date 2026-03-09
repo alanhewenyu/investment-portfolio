@@ -415,6 +415,43 @@ def compute_capital(conn: sqlite3.Connection, fx: dict[str, float]) -> float:
     return base + cash_cny - margin_off - realised_pl
 
 
+def get_dcf_valuations() -> dict[str, dict]:
+    """Read latest DCF valuation per ticker from ValuX-DB (read-only).
+
+    Returns {ticker: {'dcf_price': float, 'date': str, 'currency': str}}.
+    Graceful no-op when VALUX_DB_PATH is not set or DB doesn't exist.
+    """
+    db_path = os.environ.get('VALUX_DB_PATH')
+    if not db_path or not os.path.exists(db_path):
+        return {}
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT v.ticker, v.gap_adjusted_price, v.price_per_share,
+                   v.currency, v.valuation_date
+            FROM valuations v
+            INNER JOIN (
+                SELECT ticker, MAX(valuation_date) AS max_date
+                FROM valuations GROUP BY ticker
+            ) latest ON v.ticker = latest.ticker
+                    AND v.valuation_date = latest.max_date
+        """).fetchall()
+        conn.close()
+        result = {}
+        for r in rows:
+            price = r['gap_adjusted_price'] or r['price_per_share']
+            if price and price > 0:
+                result[r['ticker']] = {
+                    'dcf_price': round(price, 2),
+                    'date': r['valuation_date'],
+                    'currency': r['currency'],
+                }
+        return result
+    except Exception:
+        return {}
+
+
 def init_db(db_path: str | None = None) -> None:
     with get_conn(db_path) as conn:
         conn.executescript(SCHEMA)
