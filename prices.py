@@ -87,9 +87,9 @@ def _is_b_share(ticker: str) -> bool:
     if not ticker:
         return False
     code = ticker.split('.')[0]
-    # Shanghai B: 900xxx, Shenzhen B: 200xxx
+    # Shanghai B: 900xxx, Shenzhen B: 20xxxx (200xxx–209xxx)
     return (ticker.endswith('.SS') and code.startswith('900')) or \
-           (ticker.endswith('.SZ') and code.startswith('200'))
+           (ticker.endswith('.SZ') and code[:2] == '20' and code[2:3].isdigit())
 
 
 def _infer_currency(ticker: str) -> str | None:
