@@ -1380,7 +1380,8 @@ def render_holdings(df, fx):
         _mos = r.get('mos_pct')
         _dcf_dt = r.get('dcf_date', '')
         if _dcf is not None and not pd.isna(_dcf):
-            html += f'<td class="num" title="{_dcf_dt}">{_dcf:,.2f}</td>'
+            _vv_url = f'http://localhost:8502/?search={r["ticker"]}'
+            html += f'<td class="num" title="{_dcf_dt}"><a href="{_vv_url}" target="_blank" style="color:inherit;text-decoration:underline dotted">{_dcf:,.2f}</a></td>'
             if _mos is not None and not pd.isna(_mos):
                 _mos_cls = 'up' if _mos > 0 else 'dn' if _mos < 0 else ''
                 _mos_sign = '+' if _mos > 0 else ''
