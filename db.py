@@ -416,12 +416,12 @@ def compute_capital(conn: sqlite3.Connection, fx: dict[str, float]) -> float:
 
 
 def get_dcf_valuations() -> dict[str, dict]:
-    """Read latest DCF valuation per ticker from ValuX-DB (read-only).
+    """Read latest DCF valuation per ticker from ValueScope DB (read-only).
 
     Returns {ticker: {'dcf_price': float, 'date': str, 'currency': str}}.
-    Graceful no-op when VALUX_DB_PATH is not set or DB doesn't exist.
+    Graceful no-op when VS_DB_PATH is not set or DB doesn't exist.
     """
-    db_path = os.environ.get('VALUX_DB_PATH')
+    db_path = os.environ.get('VS_DB_PATH') or os.environ.get('VALUX_DB_PATH')
     if not db_path or not os.path.exists(db_path):
         return {}
     try:

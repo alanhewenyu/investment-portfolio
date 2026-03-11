@@ -116,6 +116,13 @@ def take_snapshot(dry_run=False):
     print(f"\nPositions: {len(positions)} ({stale_count} stale prices)")
     print(f"Equity MV:  ¥{_fmt(equity_mv)}")
 
+    # ── Guard: abort if too many prices are stale (broken environment) ──
+    if positions and stale_count / len(positions) > 0.5:
+        print(f"\n✗ ABORT: {stale_count}/{len(positions)} prices stale — "
+              f"environment likely broken (yfinance missing?). Snapshot NOT saved.")
+        conn.close()
+        return None
+
     # ── Cash ──
     cash_cny = 0.0
     for row in conn.execute("SELECT currency, balance FROM cash_balances"):

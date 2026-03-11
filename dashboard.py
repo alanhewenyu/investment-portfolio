@@ -636,14 +636,22 @@ def render_kpi(df, cash_df, fx, current_capital=None):
             except Exception:
                 _md_dates = set()
 
-            # Find most recent snapshot (before today) that has market detail
-            # Note: _past is sorted DESC (newest first from load_snapshots)
+            # Find snapshot closest to ~7 days ago that has market detail.
+            # This gives a meaningful multi-day comparison instead of always
+            # picking yesterday (which would show "Last 1d" forever).
             _yesterday_str = (pd.Timestamp.now() - pd.Timedelta(days=1)).strftime('%Y-%m-%d')
-            for _i in range(len(_past)):  # index 0 = newest
-                _d = _past.iloc[_i]['date']
-                if _d <= _yesterday_str and _d in _md_dates:
-                    _wk_base_date = _d
-                    break
+            _candidates = [
+                _past.iloc[_i]['date']
+                for _i in range(len(_past))
+                if _past.iloc[_i]['date'] <= _yesterday_str
+                and _past.iloc[_i]['date'] in _md_dates
+            ]
+            if _candidates:
+                _wk_target = pd.Timestamp(_week_ago)
+                _wk_base_date = min(
+                    _candidates,
+                    key=lambda d: abs((pd.Timestamp(d) - _wk_target).days),
+                )
             if _wk_base_date and _market_mv:
                 # Convert snapshot to CNY at current FX (FX-neutral comparison)
                 _base_mv = _resolve_snapshot_mv(_wk_base_date, fx)
@@ -943,10 +951,10 @@ def _record_snapshot(net_assets, equity_mv, cash_cny, leverage_cny, total_pnl_cn
     if now.hour < 6:
         return
 
-    # Skip Sunday — no markets trade on Sunday.
-    # Saturday is kept: US markets close Friday 4PM ET = Saturday ~4AM Beijing time,
-    # so the Saturday snapshot captures Friday's closing prices.
-    if now.dayofweek == 6:  # Sunday
+    # Skip Sun/Mon — matches cron convention (snapshot date − 1 = trading date).
+    # Sat 6AM captures Friday close; Tue 6AM captures Monday close.
+    # Monday dashboard snapshots would get trading_date = Sunday (wrong).
+    if now.dayofweek in (6, 0):  # Sun=6, Mon=0
         return
 
     today = now.strftime('%Y-%m-%d')
@@ -1161,6 +1169,16 @@ def render_holdings(df, fx):
 
     has_industry = df['industry'].str.len().sum() > 0
 
+    # Column group toggles — let users show/hide P&L column groups
+    _col_opts = ["Daily", "YTD", "Total", "DCF"]
+    _visible = st.pills("Columns", _col_opts, default=_col_opts,
+                         selection_mode="multi", label_visibility="collapsed")
+    _visible = _visible or []
+    show_daily = "Daily" in _visible
+    show_ytd = "YTD" in _visible
+    show_total = "Total" in _visible
+    show_dcf = "DCF" in _visible
+
     # ── Frozen column left offsets (cumulative widths) ──
     _freeze_cols = {
         'Name':   ('left:0px', 140),
@@ -1220,6 +1238,7 @@ def render_holdings(df, fx):
 .holdings-wrap{overflow:auto;max-height:82vh;max-width:100%;border:1px solid var(--pf-border);border-radius:8px;margin-bottom:12px}
 .holdings-table{width:max-content;min-width:100%;border-collapse:separate;border-spacing:0;font-family:var(--pf-mono);font-size:13px}
 .holdings-table th{text-align:left;padding:6px 10px;font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--pf-text2);border-bottom:1px solid var(--pf-border);background:var(--pf-bg);white-space:nowrap;position:sticky;top:0;z-index:5}
+.holdings-table thead tr:nth-child(2) th{top:28px}
 .holdings-table th.num{text-align:right}
 .holdings-table th.sub{font-size:10px;font-weight:400;text-transform:none;letter-spacing:0;padding-top:0;border-bottom:2px solid var(--pf-border)}
 .holdings-table td{padding:5px 10px;border-bottom:1px solid var(--pf-border);color:var(--pf-text);white-space:nowrap;background:var(--pf-bg)}
@@ -1231,7 +1250,8 @@ def render_holdings(df, fx):
 .holdings-table thead .frozen{z-index:6}
 .holdings-table .freeze-end{box-shadow:2px 0 4px rgba(0,0,0,.05)}
 .holdings-table tbody tr:last-child td{border-bottom:none}
-.holdings-table tfoot td{border-top:2px solid var(--pf-border);border-bottom:none;font-weight:600;padding:8px 10px}
+.holdings-table tfoot td{border-top:2px solid var(--pf-border);border-bottom:none;font-weight:600;padding:8px 10px;position:sticky;bottom:0;background:var(--pf-bg);z-index:3}
+.holdings-table tfoot td.frozen{z-index:4}
 .holdings-table .row-link{color:var(--pf-accent);cursor:pointer;font:inherit;font-family:var(--pf-mono);font-size:13px}
 .holdings-table .row-link:hover{text-decoration:underline}
 .holdings-table td.pnl-pos,.holdings-table tfoot td.pnl-pos{color:var(--pf-green)!important}
@@ -1253,15 +1273,19 @@ def render_holdings(df, fx):
     html += '<th class="num">Price</th>'
     html += '<th class="num">MV</th>'
     html += '<th class="num">MV(¥)</th>'
-    html += '<th class="num">Daily P&L</th>'
-    html += '<th class="num">Daily%</th>'
-    html += '<th class="num" title="Baseline: 2026-03-06 Close">YTD P&L</th>'
-    html += '<th class="num" title="Baseline: 2026-03-06 Close · Denominator: avg(baseline cost, current cost)">YTD P&L%</th>'
-    html += '<th class="num">Total P&L</th>'
-    html += '<th class="num">Total P&L %</th>'
-    html += '<th class="num" title="DCF intrinsic value (ValuX)">DCF</th>'
-    html += '<th class="num" title="Margin of Safety = (DCF − Price) / DCF">MoS%</th>'
     html += '<th class="num">Wt%</th>'
+    if show_daily:
+        html += '<th class="num">Daily P&L</th>'
+        html += '<th class="num">Daily%</th>'
+    if show_ytd:
+        html += '<th class="num" title="Baseline: 2026-03-06 Close">YTD P&L</th>'
+        html += '<th class="num" title="Baseline: 2026-03-06 Close · Denominator: avg(baseline cost, current cost)">YTD P&L%</th>'
+    if show_total:
+        html += '<th class="num">Total P&L</th>'
+        html += '<th class="num">Total P&L %</th>'
+    if show_dcf:
+        html += '<th class="num" title="DCF intrinsic value (ValuX)">DCF</th>'
+        html += '<th class="num" title="Margin of Safety = (DCF − Price) / DCF">MoS%</th>'
     html += '</tr>'
 
     # Header row 2 — currency / sub-labels
@@ -1292,15 +1316,19 @@ def render_holdings(df, fx):
     html += '<th class="sub num">original</th>'
     html += '<th class="sub num">original</th>'
     html += '<th class="sub num">CNY</th>'
-    html += '<th class="sub num">CNY</th>'
     html += '<th class="sub num"></th>'
-    html += '<th class="sub num">CNY</th>'
-    html += '<th class="sub num"></th>'
-    html += '<th class="sub num">CNY</th>'
-    html += '<th class="sub num"></th>'
-    html += '<th class="sub num">original</th>'
-    html += '<th class="sub num"></th>'
-    html += '<th class="sub num"></th>'
+    if show_daily:
+        html += '<th class="sub num">CNY</th>'
+        html += '<th class="sub num"></th>'
+    if show_ytd:
+        html += '<th class="sub num">CNY</th>'
+        html += '<th class="sub num"></th>'
+    if show_total:
+        html += '<th class="sub num">CNY</th>'
+        html += '<th class="sub num"></th>'
+    if show_dcf:
+        html += '<th class="sub num">original</th>'
+        html += '<th class="sub num"></th>'
     html += '</tr></thead>'
 
     # Build sidebar-index lookup: (ticker, broker) → selectbox index
@@ -1369,28 +1397,31 @@ def render_holdings(df, fx):
         html += f'<td class="num">{r["price"]:,.2f}</td>'
         html += f'<td class="num">{r["market_value"]:,.0f}</td>'
         html += f'<td class="num">{r["market_value_cny"]:,.0f}</td>'
-        html += _pnl_td(dp_cny)
-        html += _pnl_td(dpct, decimals=1, is_pct=True)
-        html += _pnl_td(r.get('ytd_pnl_cny'))
-        html += _pnl_td(r.get('ytd_pnl_pct'), decimals=1, is_pct=True)
-        html += _pnl_td(pnl_cny)
-        html += _pnl_td(r['pnl_pct'], decimals=1, is_pct=True)
-        # DCF + MoS%
-        _dcf = r.get('dcf_price')
-        _mos = r.get('mos_pct')
-        _dcf_dt = r.get('dcf_date', '')
-        if _dcf is not None and not pd.isna(_dcf):
-            _vv_url = f'http://localhost:8502/?search={r["ticker"]}'
-            html += f'<td class="num" title="{_dcf_dt}"><a href="{_vv_url}" target="_blank" style="color:inherit;text-decoration:underline dotted">{_dcf:,.2f}</a></td>'
-            if _mos is not None and not pd.isna(_mos):
-                _mos_cls = 'up' if _mos > 0 else 'dn' if _mos < 0 else ''
-                _mos_sign = '+' if _mos > 0 else ''
-                html += f'<td class="num {_mos_cls}">{_mos_sign}{_mos:.1f}%</td>'
-            else:
-                html += '<td class="num">—</td>'
-        else:
-            html += '<td class="num">—</td><td class="num">—</td>'
         html += f'<td class="num">{r["weight"]:.1f}%</td>'
+        if show_daily:
+            html += _pnl_td(dp_cny)
+            html += _pnl_td(dpct, decimals=1, is_pct=True)
+        if show_ytd:
+            html += _pnl_td(r.get('ytd_pnl_cny'))
+            html += _pnl_td(r.get('ytd_pnl_pct'), decimals=1, is_pct=True)
+        if show_total:
+            html += _pnl_td(pnl_cny)
+            html += _pnl_td(r['pnl_pct'], decimals=1, is_pct=True)
+        if show_dcf:
+            _dcf = r.get('dcf_price')
+            _mos = r.get('mos_pct')
+            _dcf_dt = r.get('dcf_date', '')
+            if _dcf is not None and not pd.isna(_dcf):
+                _vv_url = f'http://localhost:8502/?search={r["ticker"]}'
+                html += f'<td class="num" title="{_dcf_dt}"><a href="{_vv_url}" target="_blank" style="color:inherit;text-decoration:underline dotted">{_dcf:,.2f}</a></td>'
+                if _mos is not None and not pd.isna(_mos):
+                    _mos_cls = 'up' if _mos > 0 else 'dn' if _mos < 0 else ''
+                    _mos_sign = '+' if _mos > 0 else ''
+                    html += f'<td class="num {_mos_cls}">{_mos_sign}{_mos:.1f}%</td>'
+                else:
+                    html += '<td class="num">—</td>'
+            else:
+                html += '<td class="num">—</td><td class="num">—</td>'
         html += '</tr>'
 
     html += '</tbody>'
@@ -1415,29 +1446,31 @@ def render_holdings(df, fx):
     html += '<td class="num"></td>'  # Cost
     html += '<td class="num"></td>'  # MV local
     html += f'<td class="num"><b>{t_mv_cny:,.0f}</b></td>'
-    dp_sign = '+' if t_dp_cny > 0 else ''
-    html += f'<td class="num {dp_cls}"><b>{dp_sign}{t_dp_cny:,.0f}</b></td>'
-    dpp_sign = '+' if dp_pct_total > 0 else ''
-    html += f'<td class="num {dp_cls}"><b>{dpp_sign}{dp_pct_total:.1f}%</b></td>'
-    # YTD totals (before Total P&L)
-    _has_ytd = 'ytd_pnl_cny' in filtered.columns and filtered['ytd_pnl_cny'].notna().any()
-    if _has_ytd:
-        _ytd_avg_cost = (t_ytd_base_cost + t_ytd_cur_cost) / 2
-        ytd_pct_total = (t_ytd_cny / _ytd_avg_cost * 100) if _ytd_avg_cost else 0
-        ytd_cls = _pnl_class(t_ytd_cny)
-        ytd_sign = '+' if t_ytd_cny > 0 else ''
-        html += f'<td class="num {ytd_cls}"><b>{ytd_sign}{t_ytd_cny:,.0f}</b></td>'
-        ytdp_sign = '+' if ytd_pct_total > 0 else ''
-        html += f'<td class="num {ytd_cls}"><b>{ytdp_sign}{ytd_pct_total:.1f}%</b></td>'
-    else:
-        html += '<td class="num"></td><td class="num"></td>'
-    # Total P&L
-    pnl_sign = '+' if t_pnl_cny > 0 else ''
-    html += f'<td class="num {pnl_cls}"><b>{pnl_sign}{t_pnl_cny:,.0f}</b></td>'
-    pp_sign = '+' if pnl_pct_total > 0 else ''
-    html += f'<td class="num {pnl_cls}"><b>{pp_sign}{pnl_pct_total:.1f}%</b></td>'
-    html += '<td class="num"></td><td class="num"></td>'  # DCF, MoS%
     html += f'<td class="num"><b>{t_wt:.1f}%</b></td>'
+    if show_daily:
+        dp_sign = '+' if t_dp_cny > 0 else ''
+        html += f'<td class="num {dp_cls}"><b>{dp_sign}{t_dp_cny:,.0f}</b></td>'
+        dpp_sign = '+' if dp_pct_total > 0 else ''
+        html += f'<td class="num {dp_cls}"><b>{dpp_sign}{dp_pct_total:.1f}%</b></td>'
+    if show_ytd:
+        _has_ytd = 'ytd_pnl_cny' in filtered.columns and filtered['ytd_pnl_cny'].notna().any()
+        if _has_ytd:
+            _ytd_avg_cost = (t_ytd_base_cost + t_ytd_cur_cost) / 2
+            ytd_pct_total = (t_ytd_cny / _ytd_avg_cost * 100) if _ytd_avg_cost else 0
+            ytd_cls = _pnl_class(t_ytd_cny)
+            ytd_sign = '+' if t_ytd_cny > 0 else ''
+            html += f'<td class="num {ytd_cls}"><b>{ytd_sign}{t_ytd_cny:,.0f}</b></td>'
+            ytdp_sign = '+' if ytd_pct_total > 0 else ''
+            html += f'<td class="num {ytd_cls}"><b>{ytdp_sign}{ytd_pct_total:.1f}%</b></td>'
+        else:
+            html += '<td class="num"></td><td class="num"></td>'
+    if show_total:
+        pnl_sign = '+' if t_pnl_cny > 0 else ''
+        html += f'<td class="num {pnl_cls}"><b>{pnl_sign}{t_pnl_cny:,.0f}</b></td>'
+        pp_sign = '+' if pnl_pct_total > 0 else ''
+        html += f'<td class="num {pnl_cls}"><b>{pp_sign}{pnl_pct_total:.1f}%</b></td>'
+    if show_dcf:
+        html += '<td class="num"></td><td class="num"></td>'  # DCF, MoS%
     html += '</tr></tfoot>'
 
     html += '</table></div>'
@@ -1806,6 +1839,7 @@ def render_risk_analytics():
     snap['date_dt'] = pd.to_datetime(snap['date'])
     snap['nav'] = snap['net_assets'].astype(float)
     snap['pnl'] = snap['total_pnl_cny'].astype(float)
+    _inception_date = snap['date_dt'].iloc[0]  # base date (before filtering drops it)
 
     # ── Flow-adjusted period returns ──
     snap['_gap_days'] = snap['date_dt'].diff().dt.days
@@ -1864,7 +1898,7 @@ def render_risk_analytics():
     _total = len(returns)
     _win_rate = _win / _total * 100
     _total_ret = snap['cum_ret_idx'].iloc[-1] / 100 - 1
-    _years = (snap['date_dt'].iloc[-1] - snap['date_dt'].iloc[0]).days / 365.25
+    _years = (snap['date_dt'].iloc[-1] - _inception_date).days / 365.25
     _annual_ret = (1 + _total_ret) ** (1 / _years) - 1 if _years > 0.1 else _total_ret
     _calmar = abs(_annual_ret / _max_dd) if _max_dd != 0 else 0
 
@@ -1881,7 +1915,13 @@ def render_risk_analytics():
             f'</div>'
         )
 
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c0, c1, c2, c3, c4, c5 = st.columns(6)
+    with c0:
+        _arc = 'var(--pf-green)' if _annual_ret >= 0 else 'var(--pf-red)'
+        _inc_str = _inception_date.strftime('%y/%m')
+        _now_str = snap['date_dt'].iloc[-1].strftime('%y/%m')
+        _ar_sub = f'{_inc_str}–{_now_str} ({_years:.1f}yr)' if _years >= 1 else f'{_inc_str}–{_now_str} ({_years*12:.0f}mo)'
+        st.markdown(_risk_card('Ann. Return', f'{_annual_ret:.1%}', _ar_sub, _arc), unsafe_allow_html=True)
     with c1:
         _vc = 'var(--pf-green)' if _annual_vol < 0.15 else ('var(--pf-text)' if _annual_vol < 0.25 else 'var(--pf-red)')
         st.markdown(_risk_card('Ann. Volatility', f'{_annual_vol:.1%}',
@@ -2258,11 +2298,12 @@ def render_pnl_journal(df=None, fx=None):
         # Sat→Fri, Tue→Mon, Wed→Tue, etc. Sun/Mon snapshots shouldn't exist.
         snap['trading_date_dt'] = snap['date_dt'] - pd.Timedelta(days=1)
         snap['trading_date'] = snap['trading_date_dt'].dt.strftime('%Y-%m-%d')
-        # Keep full snap for journal (may have NaN deltas for first entry)
-        snap_full = snap.copy()
-        snap = snap.dropna(subset=['daily_pnl'])
         # Drop rows where trading date falls on a weekend (no real trading)
         snap = snap[snap['trading_date_dt'].dt.dayofweek < 5]
+        # Keep full snap for journal (may have NaN deltas for first entry)
+        # Also filtered to weekdays — weekend trading_dates are meaningless.
+        snap_full = snap.copy()
+        snap = snap.dropna(subset=['daily_pnl'])
 
         if snap.empty and snap_full.empty and _rt_daily_pnl is None:
             return
@@ -2551,6 +2592,10 @@ def render_closed(fx=None):
 
 @st.fragment
 def render_sidebar():
+    # Show pending toast from previous rerun (survives st.rerun)
+    if '_sidebar_toast' in st.session_state:
+        st.toast(st.session_state.pop('_sidebar_toast'))
+
     st.markdown("### Position Management")
 
     tab1, tab2, tab3, tab4 = st.tabs(["Edit", "Delete", "Cash/Margin", "Import"])
@@ -2603,7 +2648,7 @@ def render_sidebar():
                               quantity or 0, cost_price or 0.0,
                               quantity or 0, cost_price or 0.0, _orig_id))
                         conn.commit()
-                    st.success(f"Updated: {name} ({ticker})")
+                    st.session_state['_sidebar_toast'] = f"✅ Updated: {name} ({ticker})"
                     load_positions.clear()
                     build_portfolio.clear()
                     st.rerun()
@@ -2627,7 +2672,7 @@ def render_sidebar():
                         with get_conn() as conn:
                             upsert_position(conn, ticker, name, market, broker, currency, qty, cp)
                             conn.commit()
-                        st.success(f"Added: {name} ({ticker})")
+                        st.session_state['_sidebar_toast'] = f"✅ Added: {name} ({ticker})"
                         load_positions.clear()
                         build_portfolio.clear()
                         st.rerun()
@@ -2694,7 +2739,7 @@ def render_sidebar():
                     )
                     conn.execute("DELETE FROM positions WHERE id=?", (int(sel_row['id']),))
                     conn.commit()
-                st.success(f"Closed: {sel_row['name']} (P&L: {realized_pnl_cny:,.0f} CNY)")
+                st.session_state['_sidebar_toast'] = f"✅ Closed: {sel_row['name']} (P&L: {realized_pnl_cny:,.0f} CNY)"
                 load_positions.clear()
                 build_portfolio.clear()
                 load_closed.clear()
@@ -2760,7 +2805,7 @@ def render_sidebar():
                             changed += 1
                     conn.commit()
                 if changed:
-                    st.success(f"Updated {changed} balance(s)")
+                    st.session_state['_sidebar_toast'] = f"✅ Updated {changed} cash balance(s)"
                     load_cash.clear()
                     st.rerun()
                 else:
@@ -2777,7 +2822,7 @@ def render_sidebar():
                     with get_conn() as conn:
                         upsert_cash(conn, new_acct, new_cur, new_bal)
                         conn.commit()
-                    st.success(f"Added: {new_acct} {new_cur}")
+                    st.session_state['_sidebar_toast'] = f"✅ Added: {new_acct} {new_cur}"
                     load_cash.clear()
                     st.rerun()
 
@@ -2838,7 +2883,7 @@ def render_sidebar():
                             changed += 1
                     conn.commit()
                 if changed:
-                    st.success(f"Updated {changed} margin(s)")
+                    st.session_state['_sidebar_toast'] = f"✅ Updated {changed} margin(s)"
                     load_margin.clear()
                     st.rerun()
                 else:
@@ -2899,7 +2944,7 @@ def render_sidebar():
                                                 float(r['quantity']),
                                                 float(r['cost_price']))
                             conn.commit()
-                        st.success(f"Imported {len(pos_imp)} positions ✓")
+                        st.session_state['_sidebar_toast'] = f"✅ Imported {len(pos_imp)} positions"
                         load_positions.clear()
                         build_portfolio.clear()
                         st.rerun()
@@ -2927,7 +2972,7 @@ def render_sidebar():
                                             str(r['currency']).strip().upper(),
                                             float(r['balance']))
                             conn.commit()
-                        st.success(f"Imported {len(cash_imp)} cash balances ✓")
+                        st.session_state['_sidebar_toast'] = f"✅ Imported {len(cash_imp)} cash balances"
                         load_cash.clear()
                         st.rerun()
             except Exception as e:
@@ -2969,7 +3014,7 @@ def render_sidebar():
                                                 else None),
                                 )
                             conn.commit()
-                        st.success(f"Imported {len(closed_imp)} closed trades ✓")
+                        st.session_state['_sidebar_toast'] = f"✅ Imported {len(closed_imp)} closed trades"
                         load_closed.clear()
                         st.rerun()
             except Exception as e:
