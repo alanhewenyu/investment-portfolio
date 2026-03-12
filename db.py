@@ -274,6 +274,69 @@ def _migrate_snapshot_capital(conn):
         pass  # column already exists
 
 
+def _migrate_snapshot_market_pnl(conn):
+    """Add market_pnl JSON column to daily_snapshots (idempotent).
+
+    Stores per-market total P&L (unrealized + realized) in CNY,
+    e.g. {"港股": 195000, "美股": 450000}.
+    Used by weekly/YTD strip to show per-market P&L contribution.
+    """
+    try:
+        conn.execute("ALTER TABLE daily_snapshots ADD COLUMN market_pnl TEXT")
+    except sqlite3.OperationalError:
+        pass  # column already exists
+
+
+def _migrate_snapshot_realized_pnl(conn):
+    """Add realized_pnl_cny column to daily_snapshots and backfill (idempotent).
+
+    Stores cumulative realized P&L from closed_trades at snapshot time.
+    Together with total_pnl_cny (unrealized), enables accurate period P&L:
+    period_pnl = (unrealized_B + realized_B) - (unrealized_A + realized_A).
+    """
+    try:
+        conn.execute("ALTER TABLE daily_snapshots ADD COLUMN realized_pnl_cny REAL")
+    except sqlite3.OperationalError:
+        pass  # column already exists
+
+    # Backfill: for each snapshot without realized_pnl_cny, compute from closed_trades.
+    # Uses close_date when available; NULL-dated trades are treated as pre-existing.
+    nulls = conn.execute(
+        "SELECT date FROM daily_snapshots WHERE realized_pnl_cny IS NULL"
+    ).fetchall()
+    if nulls:
+        for row in nulls:
+            sd = row[0]
+            rpnl = conn.execute("""
+                SELECT COALESCE(SUM(realized_pnl_cny), 0)
+                FROM closed_trades
+                WHERE close_date IS NULL OR close_date <= ?
+            """, (sd,)).fetchone()[0]
+            conn.execute(
+                "UPDATE daily_snapshots SET realized_pnl_cny = ? WHERE date = ?",
+                (rpnl, sd)
+            )
+
+
+def _migrate_snapshot_stock_pnl(conn):
+    """Create snapshot_stock_pnl table for per-stock P&L snapshots (idempotent).
+
+    Stores per-ticker unrealized + realized P&L at each snapshot date.
+    Enables accurate period P&L by stock:  delta = pnl_now[ticker] - pnl_base[ticker]
+    By-market aggregation:  sum per market for strip / attribution.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS snapshot_stock_pnl (
+            date    TEXT NOT NULL,
+            ticker  TEXT NOT NULL,
+            name    TEXT,
+            market  TEXT,
+            pnl_cny REAL DEFAULT 0,
+            PRIMARY KEY (date, ticker)
+        )
+    """)
+
+
 def _migrate_normalize_broker_names(conn):
     """Normalize broker names in closed_trades to match positions table (idempotent)."""
     conn.execute("UPDATE closed_trades SET broker = '中信' WHERE broker = '中信证券'")
@@ -460,11 +523,15 @@ def init_db(db_path: str | None = None) -> None:
         _migrate_snapshot_market_data(conn)
         _migrate_positions_created_at(conn)
         _migrate_snapshot_capital(conn)
+        _migrate_snapshot_market_pnl(conn)
+        _migrate_snapshot_realized_pnl(conn)
+        _migrate_snapshot_stock_pnl(conn)
         _migrate_normalize_broker_names(conn)
         _migrate_backfill_realized_pnl_cny(conn)
         _migrate_backfill_market_detail(conn)
         _migrate_ytd_add_qty_cost(conn)
         _migrate_seed_ytd_2026(conn)
+        _migrate_backfill_stock_pnl_ytd_base(conn)
 
 
 def upsert_position(conn: sqlite3.Connection, ticker: str, name: str, market: str,
@@ -553,21 +620,43 @@ def upsert_margin(conn: sqlite3.Connection, broker: str, category: str,
 def upsert_snapshot(conn: sqlite3.Connection, date: str, total_assets: float,
                     net_assets: float, equity_mv: float, cash: float, leverage: float,
                     total_pnl: float, market_data: str | None = None,
-                    capital: float | None = None, market_detail: dict | None = None) -> None:
+                    capital: float | None = None, market_detail: dict | None = None,
+                    market_pnl: str | None = None,
+                    realized_pnl_cny: float | None = None,
+                    stock_pnl: list[dict] | None = None) -> None:
     """Record daily snapshot — first write of the day wins (no overwrite).
 
     This ensures a stable baseline for "Last 1d" / weekly comparisons:
     the snapshot always reflects the portfolio state at the first load of the day.
 
-    market_detail: dict {market: {currency: mv}} — structured per-market data.
-                   Written to snapshot_market_detail table alongside the JSON blob.
+    market_detail:    dict {market: {currency: mv}} — structured per-market data.
+                      Written to snapshot_market_detail table alongside the JSON blob.
+    market_pnl:       JSON string {market: total_pnl_cny} — per-market total P&L
+                      (unrealized + realized) in CNY.  (deprecated — use stock_pnl)
+    realized_pnl_cny: cumulative realized P&L from closed_trades at snapshot time.
+    stock_pnl:        list of {ticker, name, market, pnl_cny} — per-stock total P&L
+                      (unrealized + realized).  By-market derived via GROUP BY market.
     """
     conn.execute("""
         INSERT OR IGNORE INTO daily_snapshots
             (date, total_assets, net_assets, equity_mv_cny, cash_cny,
-             leverage_cny, total_pnl_cny, market_data, capital, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now','localtime'))
-    """, (date, total_assets, net_assets, equity_mv, cash, leverage, total_pnl, market_data, capital))
+             leverage_cny, total_pnl_cny, market_data, capital, market_pnl,
+             realized_pnl_cny, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now','localtime'))
+    """, (date, total_assets, net_assets, equity_mv, cash, leverage, total_pnl,
+          market_data, capital, market_pnl, realized_pnl_cny))
+
+    # Backfill market_pnl / realized_pnl_cny for rows written before migrations
+    if market_pnl:
+        conn.execute("""
+            UPDATE daily_snapshots SET market_pnl = ?
+            WHERE date = ? AND market_pnl IS NULL
+        """, (market_pnl, date))
+    if realized_pnl_cny is not None:
+        conn.execute("""
+            UPDATE daily_snapshots SET realized_pnl_cny = ?
+            WHERE date = ? AND realized_pnl_cny IS NULL
+        """, (realized_pnl_cny, date))
 
     # Also write structured market detail (first-write-wins via INSERT OR IGNORE)
     if market_detail:
@@ -578,6 +667,14 @@ def upsert_snapshot(conn: sqlite3.Connection, date: str, total_assets: float,
                         INSERT OR IGNORE INTO snapshot_market_detail (date, market, currency, mv)
                         VALUES (?, ?, ?, ?)
                     """, (date, market, currency, mv))
+
+    # Per-stock P&L snapshot (first-write-wins via INSERT OR IGNORE)
+    if stock_pnl:
+        for sp in stock_pnl:
+            conn.execute("""
+                INSERT OR IGNORE INTO snapshot_stock_pnl (date, ticker, name, market, pnl_cny)
+                VALUES (?, ?, ?, ?, ?)
+            """, (date, sp['ticker'], sp.get('name'), sp.get('market'), sp.get('pnl_cny', 0)))
 
 
 def get_ytd_baselines(conn: sqlite3.Connection, year: int) -> dict[str, dict]:
@@ -681,6 +778,86 @@ def _migrate_seed_ytd_2026(conn):
     if count > 0:
         return  # already seeded
     record_ytd_baselines(conn, 2026, _YTD_2026_SEED, '2026-03-06')
+    conn.commit()
+
+
+def _migrate_backfill_stock_pnl_ytd_base(conn):
+    """Backfill snapshot_stock_pnl for the YTD base date (idempotent).
+
+    Computes per-stock total P&L (unrealized + realized) at the YTD base
+    date using ytd_baseline_prices (price/qty/cost) + closed_trades (realized).
+    This enables Attribution YTD to use per-stock snapshot comparison from day one.
+    """
+    cur_year = datetime.now().year
+
+    # Find the YTD base date: last snapshot of the previous year (same logic as dashboard)
+    row = conn.execute(
+        "SELECT MAX(date) FROM snapshot_market_detail WHERE date < ?",
+        (f'{cur_year}-01-01',)
+    ).fetchone()
+    if not row or not row[0]:
+        # Fallback for first year: earliest snapshot of current year
+        row = conn.execute(
+            "SELECT MIN(date) FROM snapshot_market_detail WHERE date >= ?",
+            (f'{cur_year}-01-01',)
+        ).fetchone()
+    if not row or not row[0]:
+        return
+    base_date = row[0]
+
+    # Skip if already backfilled
+    existing = conn.execute(
+        "SELECT COUNT(*) FROM snapshot_stock_pnl WHERE date = ?",
+        (base_date,)
+    ).fetchone()[0]
+    if existing > 0:
+        return
+
+    # FX rates (current — close enough for a few-days-old backfill)
+    fx = {'CNY': 1.0}
+    for r in conn.execute("SELECT currency, rate_to_cny FROM fx_rates"):
+        fx[r[0]] = r[1]
+    if not fx.get('USD'):
+        return  # no FX data yet — skip until first dashboard run
+
+    # Position info for name/market lookup
+    pos_info = {}
+    for r in conn.execute("SELECT ticker, name, market FROM positions"):
+        pos_info[r[0]] = (r[1], r[2])
+
+    # Per-stock unrealized P&L from ytd_baseline_prices
+    stock_pnl = {}
+    for r in conn.execute(
+        "SELECT ticker, price, currency, quantity, cost_price "
+        "FROM ytd_baseline_prices WHERE year = ?", (cur_year,)
+    ).fetchall():
+        tk, price, cur = r[0], r[1], r[2]
+        qty = r[3] if r[3] is not None else 0
+        cost = r[4] if r[4] is not None else price   # fallback: no gain
+        pnl_cny = (price - cost) * qty * fx.get(cur, 1.0)
+        name, market = pos_info.get(tk, (tk, ''))
+        stock_pnl[tk] = {'name': name, 'market': market, 'pnl_cny': pnl_cny}
+
+    # Add realized P&L from closed_trades at or before base_date
+    for r in conn.execute(
+        "SELECT ticker, name, market, realized_pnl_cny FROM closed_trades "
+        "WHERE (close_date IS NULL OR close_date <= ?) "
+        "AND realized_pnl_cny IS NOT NULL",
+        (base_date,)
+    ).fetchall():
+        tk, nm, mkt, rpnl = r[0], r[1], r[2], r[3]
+        if tk in stock_pnl:
+            stock_pnl[tk]['pnl_cny'] += rpnl
+        else:
+            stock_pnl[tk] = {'name': nm, 'market': mkt, 'pnl_cny': rpnl}
+
+    # Write to snapshot_stock_pnl
+    for tk, sp in stock_pnl.items():
+        conn.execute(
+            "INSERT OR IGNORE INTO snapshot_stock_pnl "
+            "(date, ticker, name, market, pnl_cny) VALUES (?, ?, ?, ?, ?)",
+            (base_date, tk, sp['name'], sp['market'], sp['pnl_cny'])
+        )
     conn.commit()
 
 

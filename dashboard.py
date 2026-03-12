@@ -582,14 +582,50 @@ def render_kpi(df, cash_df, fx, current_capital=None):
         _market_snap_mv = {}
         for (mkt, cur), sub in df.groupby(['market', 'currency']):
             _market_snap_mv.setdefault(mkt, {})[cur] = float(sub['regular_mv'].sum())
+        # Per-market unrealized P&L in CNY
+        _market_unrealized_pnl = df.groupby('market')['pnl_cny'].sum().to_dict()
     else:
         total_pnl_cny = 0
         total_cost_cny = 0
         _market_mv = {}
         _market_cur_mv = {}
         _market_snap_mv = {}
+        _market_unrealized_pnl = {}
 
     pnl_pct = (total_pnl_cny / total_cost_cny * 100) if total_cost_cny != 0 else 0
+
+    # Per-market total P&L = unrealized + realized (from closed_trades)
+    closed_df = load_closed()
+    _total_realized_cny = 0.0
+    _market_realized_pnl = {}
+    if not closed_df.empty:
+        _total_realized_cny = float(closed_df['realized_pnl_cny'].sum())
+        _market_realized_pnl = closed_df.groupby('market')['realized_pnl_cny'].sum().to_dict()
+    _market_pnl_cny = {}
+    for m in set(list(_market_unrealized_pnl.keys()) + list(_market_realized_pnl.keys())):
+        _market_pnl_cny[m] = _market_unrealized_pnl.get(m, 0) + _market_realized_pnl.get(m, 0)
+
+    # Per-stock total P&L = unrealized (open positions) + realized (closed trades)
+    # Stored in snapshot_stock_pnl for period comparison by stock / by market.
+    _stock_pnl_dict = {}   # {ticker: {name, market, pnl_cny}}
+    if not df.empty:
+        for (tk, nm, mkt), sub in df.groupby(['ticker', 'name', 'market']):
+            _stock_pnl_dict[tk] = {
+                'ticker': tk, 'name': nm, 'market': mkt,
+                'pnl_cny': float(sub['pnl_cny'].sum()),
+            }
+    if not closed_df.empty:
+        for (tk, nm, mkt), sub in closed_df.groupby(['ticker', 'name', 'market']):
+            if tk in _stock_pnl_dict:
+                _stock_pnl_dict[tk]['pnl_cny'] += float(sub['realized_pnl_cny'].sum())
+            else:
+                _stock_pnl_dict[tk] = {
+                    'ticker': tk, 'name': nm, 'market': mkt,
+                    'pnl_cny': float(sub['realized_pnl_cny'].sum()),
+                }
+    _stock_pnl_list = list(_stock_pnl_dict.values()) if _stock_pnl_dict else None
+    # Share per-stock P&L with render_attribution for YTD snapshot comparison
+    st.session_state['_stock_pnl_dict'] = _stock_pnl_dict
 
     # Compute capital (shared formula from db.py) — reuse if already computed
     if current_capital is None:
@@ -602,7 +638,10 @@ def render_kpi(df, cash_df, fx, current_capital=None):
                      market_data_json=_json.dumps(_market_cur_mv, ensure_ascii=False) if _market_cur_mv else None,
                      capital=current_capital,
                      has_stale=_has_stale,
-                     market_detail=_market_snap_mv or None)
+                     market_detail=_market_snap_mv or None,
+                     market_pnl=_json.dumps(_market_pnl_cny, ensure_ascii=False) if _market_pnl_cny else None,
+                     realized_pnl_cny=_total_realized_cny,
+                     stock_pnl=_stock_pnl_list)
 
     # Daily P&L — vectorised from pre-computed daily_pnl_cny column
     daily_pnl = None
@@ -615,7 +654,10 @@ def render_kpi(df, cash_df, fx, current_capital=None):
             daily_pnl = _dp_total
             daily_pnl_pct = (_dp_total / _dp_base * 100) if _dp_base != 0 else 0
 
-    # Weekly P&L from snapshots — uses equity MV change (same metric as strip)
+    # Weekly & YTD P&L from snapshots — uses total P&L change
+    # (unrealized + realized), immune to position/cash/margin changes.
+    # Current total P&L = unrealized + realized
+    _cur_total_pnl = total_pnl_cny + _total_realized_cny
     weekly_pnl = None
     weekly_pnl_pct = None
     weekly_days = None          # actual days since comparison snapshot
@@ -626,7 +668,7 @@ def render_kpi(df, cash_df, fx, current_capital=None):
         _week_ago = (pd.Timestamp.now() - pd.Timedelta(days=7)).strftime('%Y-%m-%d')
         _past = snapshots[snapshots['date'] <= _today_str]
         if not _past.empty:
-            # Find dates that have market detail data (include today — 3/7 snapshot = 3/6 close)
+            # Find dates that have market detail data (needed for strip table)
             try:
                 with get_conn() as _md_conn:
                     _md_dates = set(r[0] for r in _md_conn.execute(
@@ -637,8 +679,6 @@ def render_kpi(df, cash_df, fx, current_capital=None):
                 _md_dates = set()
 
             # Find snapshot closest to ~7 days ago that has market detail.
-            # This gives a meaningful multi-day comparison instead of always
-            # picking yesterday (which would show "Last 1d" forever).
             _yesterday_str = (pd.Timestamp.now() - pd.Timedelta(days=1)).strftime('%Y-%m-%d')
             _candidates = [
                 _past.iloc[_i]['date']
@@ -652,46 +692,65 @@ def render_kpi(df, cash_df, fx, current_capital=None):
                     _candidates,
                     key=lambda d: abs((pd.Timestamp(d) - _wk_target).days),
                 )
-            if _wk_base_date and _market_mv:
-                # Convert snapshot to CNY at current FX (FX-neutral comparison)
-                _base_mv = _resolve_snapshot_mv(_wk_base_date, fx)
-                _cur_total = sum(_market_mv.values())
-                _base_total = sum(_base_mv.values())
-                if _base_total > 0:
-                    weekly_pnl = _cur_total - _base_total
-                    weekly_pnl_pct = weekly_pnl / _base_total * 100
+            if _wk_base_date:
+                _wk_base_snap = _past[_past['date'] == _wk_base_date]
+                if not _wk_base_snap.empty:
+                    # Base total P&L = unrealized + realized at base snapshot time
+                    _base_unrealized = float(_wk_base_snap.iloc[0]['total_pnl_cny'])
+                    _base_realized_raw = _wk_base_snap.iloc[0].get('realized_pnl_cny')
+                    _base_realized = float(_base_realized_raw) if _base_realized_raw is not None and not pd.isna(_base_realized_raw) else 0
+                    _base_total_pnl = _base_unrealized + _base_realized
+                    weekly_pnl = _cur_total_pnl - _base_total_pnl
+                    _base_cap_raw = _wk_base_snap.iloc[0].get('capital')
+                    _base_cap = float(_base_cap_raw) if _base_cap_raw is not None and not pd.isna(_base_cap_raw) and _base_cap_raw > 0 else 0
+                    if _base_cap <= 0:
+                        _base_cap = float(_wk_base_snap.iloc[0]['net_assets'])
+                    weekly_pnl_pct = weekly_pnl / _base_cap * 100 if _base_cap > 0 else 0
                     weekly_days = (pd.Timestamp.now() - pd.Timestamp(_wk_base_date)).days
-                    # Discard same-day comparison (meaningless 0 delta)
                     if weekly_days <= 0:
                         weekly_pnl = None
                         weekly_pnl_pct = None
                         weekly_days = None
 
-    # YTD from snapshot: earliest snapshot with market_detail around year-end / year-start
-    # Include late December of prior year to capture year-end baselines (e.g. 2025-12-31).
+    # YTD from snapshot: last snapshot of the previous year as baseline
     ytd_return = None
     ytd_pnl = None
     _ytd_base_date = None
     _current_year = pd.Timestamp.now().strftime('%Y')
-    _prev_year_end = f'{int(_current_year) - 1}-12-28'
     try:
         with get_conn() as _ytd_conn:
+            # Preferred: last snapshot of the previous year
             _ytd_row = _ytd_conn.execute(
-                "SELECT MIN(date) as d FROM snapshot_market_detail WHERE date >= ?",
-                (_prev_year_end,)
+                "SELECT MAX(date) as d FROM snapshot_market_detail WHERE date < ?",
+                (f'{_current_year}-01-01',)
             ).fetchone()
             if _ytd_row and _ytd_row['d']:
                 _ytd_base_date = _ytd_row['d']
+            else:
+                # Fallback for first year: earliest snapshot of current year
+                _ytd_row = _ytd_conn.execute(
+                    "SELECT MIN(date) as d FROM snapshot_market_detail WHERE date >= ?",
+                    (f'{_current_year}-01-01',)
+                ).fetchone()
+                if _ytd_row and _ytd_row['d']:
+                    _ytd_base_date = _ytd_row['d']
     except Exception:
         pass
+    st.session_state['_ytd_base_date'] = _ytd_base_date
 
-    if _ytd_base_date and _market_mv:
-        _ytd_base_mv = _resolve_snapshot_mv(_ytd_base_date, fx)
-        _ytd_cur_total = sum(_market_mv.values())
-        _ytd_base_total = sum(_ytd_base_mv.values())
-        if _ytd_base_total > 0:
-            ytd_pnl = _ytd_cur_total - _ytd_base_total
-            ytd_return = ytd_pnl / ((_ytd_base_total + _ytd_cur_total) / 2) * 100
+    if _ytd_base_date:
+        _ytd_base_snap = snapshots[snapshots['date'] == _ytd_base_date]
+        if not _ytd_base_snap.empty:
+            _ytd_base_unrealized = float(_ytd_base_snap.iloc[0]['total_pnl_cny'])
+            _ytd_base_realized_raw = _ytd_base_snap.iloc[0].get('realized_pnl_cny')
+            _ytd_base_realized = float(_ytd_base_realized_raw) if _ytd_base_realized_raw is not None and not pd.isna(_ytd_base_realized_raw) else 0
+            _ytd_base_total_pnl = _ytd_base_unrealized + _ytd_base_realized
+            ytd_pnl = _cur_total_pnl - _ytd_base_total_pnl
+            _ytd_cap_raw = _ytd_base_snap.iloc[0].get('capital')
+            _ytd_base_cap = float(_ytd_cap_raw) if _ytd_cap_raw is not None and not pd.isna(_ytd_cap_raw) and _ytd_cap_raw > 0 else 0
+            if _ytd_base_cap <= 0:
+                _ytd_base_cap = float(_ytd_base_snap.iloc[0]['net_assets'])
+            ytd_return = ytd_pnl / _ytd_base_cap * 100 if _ytd_base_cap > 0 else 0
 
     # ── Row 1: Asset overview ──
     pnl_cls = _pnl_class(total_pnl_cny)
@@ -755,15 +814,11 @@ def render_kpi(df, cash_df, fx, current_capital=None):
         <div class="kpi-sub {pnl_cls}">{_pnl_sign(pnl_pct, 1)}%</div>
     </div>'''
 
-    # Realised P&L from closed trades (use pre-converted CNY column)
-    closed_df = load_closed()
-    realized_pnl_cny = 0
-    if not closed_df.empty:
-        realized_pnl_cny = closed_df['realized_pnl_cny'].sum()
-    rp_cls = _pnl_class(realized_pnl_cny)
+    # Realised P&L from closed trades (reuse pre-computed closed_df from above)
+    rp_cls = _pnl_class(_total_realized_cny)
     html += f'''<div class="kpi-card">
         <div class="kpi-label">Realised P&L</div>
-        <div class="kpi-value {rp_cls}">{_pnl_sign(realized_pnl_cny)}</div>
+        <div class="kpi-value {rp_cls}">{_pnl_sign(_total_realized_cny)}</div>
         <div class="kpi-sub" style="color:var(--pf-text2);">{len(closed_df)} trades</div>
     </div>'''
 
@@ -823,19 +878,66 @@ def render_kpi(df, cash_df, fx, current_capital=None):
             )
         return (label, ' · '.join(pills))
 
-    def _snap_strip(label, cur_mv, prev_date):
-        """Per-market strip from snapshot comparison (FX-neutral: converts at current FX)."""
-        if not prev_date or not cur_mv:
+    def _resolve_snapshot_market_pnl(snap_date):
+        """Load per-market P&L aggregated from snapshot_stock_pnl table.
+
+        Falls back to legacy market_pnl JSON column for old snapshots.
+        Returns {market: pnl_cny} dict, or empty dict if not available.
+        """
+        # Preferred: aggregate from per-stock P&L table
+        try:
+            with get_conn() as conn:
+                rows = conn.execute(
+                    "SELECT market, SUM(pnl_cny) AS total_pnl "
+                    "FROM snapshot_stock_pnl WHERE date = ? GROUP BY market",
+                    (snap_date,)
+                ).fetchall()
+            if rows:
+                return {r['market']: r['total_pnl'] for r in rows}
+        except Exception:
+            pass
+        # Fallback: legacy market_pnl JSON column
+        try:
+            with get_conn() as conn:
+                row = conn.execute(
+                    "SELECT market_pnl FROM daily_snapshots WHERE date = ?",
+                    (snap_date,)
+                ).fetchone()
+            if row and row['market_pnl']:
+                import json as _j
+                return _j.loads(row['market_pnl'])
+        except Exception:
+            pass
+        return {}
+
+    def _pnl_strip(label, cur_pnl, prev_date):
+        """Per-market strip from total P&L comparison (unrealized + realized).
+
+        Immune to position/margin changes — compares total P&L snapshots.
+        """
+        if not prev_date or not cur_pnl:
             return ('', '')
+        prev_pnl = _resolve_snapshot_market_pnl(prev_date)
+        if not prev_pnl:
+            # Fallback: show total P&L change as single row (consistent with KPI)
+            # Old snapshots lack market_pnl; use total (unrealized + realized) delta.
+            _prev_snap = snapshots[snapshots['date'] == prev_date] if not snapshots.empty else pd.DataFrame()
+            if _prev_snap.empty:
+                return ('', '')
+            _prev_unrealized = float(_prev_snap.iloc[0]['total_pnl_cny'])
+            _prev_realized_raw = _prev_snap.iloc[0].get('realized_pnl_cny')
+            _prev_realized = float(_prev_realized_raw) if _prev_realized_raw is not None and not pd.isna(_prev_realized_raw) else 0
+            _total_chg = _cur_total_pnl - (_prev_unrealized + _prev_realized)
+            _prev_net = float(_prev_snap.iloc[0]['net_assets'])
+            return _build_strip(label, {'Total': _total_chg}, {'Total': _prev_net})
+        # P&L change per market (both snapshots have market_pnl = unrealized + realized)
+        all_markets = set(list(cur_pnl.keys()) + list(prev_pnl.keys()))
+        items = {m: cur_pnl.get(m, 0) - prev_pnl.get(m, 0) for m in all_markets}
+        # Use previous equity MV as base for percentage calculation
         prev_mv = _resolve_snapshot_mv(prev_date, fx)
-        if not prev_mv:
-            return ('', '')
-        items = {}
-        bases = {}
-        for m in set(list(cur_mv.keys()) + list(prev_mv.keys())):
-            items[m] = cur_mv.get(m, 0) - prev_mv.get(m, 0)
-            bases[m] = prev_mv.get(m, 0)
+        bases = {m: prev_mv.get(m, 0) for m in all_markets}
         return _build_strip(label, items, bases)
+
 
     strip_rows = []   # list of (label, pills_html)
 
@@ -851,16 +953,16 @@ def render_kpi(df, cash_df, fx, current_capital=None):
     if day_by_mkt:
         strip_rows.append(_build_strip('Daily', day_by_mkt, day_base_mkt))
 
-    # Weekly per-market — reuse the same base snapshot found for KPI card
-    if _wk_base_date and _market_mv and weekly_pnl is not None:
+    # Weekly per-market — P&L-based comparison (immune to position/margin changes)
+    if _wk_base_date and _market_pnl_cny and weekly_pnl is not None:
         _wk_label = f'Last {weekly_days}d' if weekly_days else 'Last 1d'
-        strip_rows.append(_snap_strip(_wk_label, _market_mv, _wk_base_date))
+        strip_rows.append(_pnl_strip(_wk_label, _market_pnl_cny, _wk_base_date))
     elif not _wk_base_date and day_by_mkt:
         strip_rows.append(_build_strip('Last 1d', day_by_mkt, day_base_mkt))
 
-    # YTD per-market strip (snapshot-based, same baseline as KPI card)
-    if _ytd_base_date and _market_mv:
-        strip_rows.append(_snap_strip('YTD', _market_mv, _ytd_base_date))
+    # YTD per-market strip — P&L-based comparison
+    if _ytd_base_date and _market_pnl_cny:
+        strip_rows.append(_pnl_strip('YTD', _market_pnl_cny, _ytd_base_date))
 
     # Render strips as aligned grid: label | per-market details
     strip_rows = [(l, p) for l, p in strip_rows if l and p]
@@ -934,7 +1036,8 @@ _ytd_baseline_confirmed = {}   # {year: True} — skip DB check once confirmed
 
 
 def _record_snapshot(net_assets, equity_mv, cash_cny, leverage_cny, total_pnl_cny,
-                     market_data_json=None, capital=None, has_stale=False, market_detail=None):
+                     market_data_json=None, capital=None, has_stale=False, market_detail=None,
+                     market_pnl=None, realized_pnl_cny=None, stock_pnl=None):
     """Auto-record today's portfolio snapshot.
 
     Rules:
@@ -963,7 +1066,8 @@ def _record_snapshot(net_assets, equity_mv, cash_cny, leverage_cny, total_pnl_cn
         with get_conn() as conn:
             upsert_snapshot(conn, today, total_assets, net_assets, equity_mv, cash_cny, leverage_cny,
                             total_pnl_cny, market_data=market_data_json, capital=capital,
-                            market_detail=market_detail)
+                            market_detail=market_detail, market_pnl=market_pnl,
+                            realized_pnl_cny=realized_pnl_cny, stock_pnl=stock_pnl)
 
             # Auto-record YTD baselines on first snapshot of a new year.
             # Uses prev_close (regular session close) as baseline price.
@@ -2021,8 +2125,12 @@ def render_risk_analytics():
 # Return Attribution
 # ────────────────────────────────────────
 
-def render_attribution(df, fx):
-    """Return attribution: by market and by top stock contributors."""
+def render_attribution(df, fx, stock_pnl_now=None, ytd_base_date=None):
+    """Return attribution: by market and by top stock contributors.
+
+    stock_pnl_now:  {ticker: {name, market, pnl_cny}} — current per-stock total P&L
+    ytd_base_date:  str — YTD base snapshot date for per-stock comparison
+    """
     if df.empty:
         return
 
@@ -2061,6 +2169,25 @@ def render_attribution(df, fx):
             _real_by_stk = _real.groupby('name')['realized_pnl_cny'].sum().reset_index()
             _real_by_stk.columns = ['name', '_real_pnl']
 
+    # ── Per-stock snapshot comparison for YTD (when available) ──
+    _ytd_snap_base = {}   # {ticker: pnl_cny} from snapshot_stock_pnl at YTD base
+    _use_ytd_snapshot = False
+    if stock_pnl_now and ytd_base_date:
+        try:
+            with get_conn() as _ac:
+                _ytd_sp_rows = _ac.execute(
+                    "SELECT ticker, name, market, pnl_cny "
+                    "FROM snapshot_stock_pnl WHERE date = ?",
+                    (ytd_base_date,)
+                ).fetchall()
+            if _ytd_sp_rows:
+                _ytd_snap_base = {r['ticker']: {
+                    'name': r['name'], 'market': r['market'], 'pnl_cny': r['pnl_cny']
+                } for r in _ytd_sp_rows}
+                _use_ytd_snapshot = True
+        except Exception:
+            pass
+
     for tab_idx, tab_name in enumerate(_attr_tabs):
         with tabs[tab_idx]:
             if tab_name == 'YTD':
@@ -2075,6 +2202,90 @@ def render_attribution(df, fx):
             else:  # Total
                 pnl_col, pnl_short = 'pnl_cny', 'Total P&L'
                 _merge_realised = True
+
+            # ── YTD: prefer per-stock snapshot comparison (accurate for cross-year closures) ──
+            if tab_name == 'YTD' and _use_ytd_snapshot and stock_pnl_now:
+                all_tickers = set(list(stock_pnl_now.keys()) + list(_ytd_snap_base.keys()))
+                _ytd_deltas = []   # [{name, market, pnl_delta}, ...]
+                for tk in all_tickers:
+                    cur = stock_pnl_now.get(tk, {})
+                    base = _ytd_snap_base.get(tk, {})
+                    delta = cur.get('pnl_cny', 0) - base.get('pnl_cny', 0)
+                    nm = cur.get('name') or base.get('name') or tk
+                    mkt = cur.get('market') or base.get('market') or ''
+                    _ytd_deltas.append({'name': nm, 'ticker': tk, 'market': mkt, 'pnl_delta': delta})
+
+                _ytd_delta_df = pd.DataFrame(_ytd_deltas)
+                col_mkt, col_stk = st.columns(2)
+
+                with col_mkt:
+                    _grp = _ytd_delta_df.groupby('market')['pnl_delta'].sum()
+                    _grp = _grp.to_frame('_pnl')
+                    sorted_mkts = sorted(_grp.index,
+                                         key=lambda m: _MKT_ORD.index(m) if m in _MKT_ORD else 99)
+                    _grp = _grp.loc[sorted_mkts]
+                    bar_colors = ['#ef4444' if v >= 0 else '#22c55e' for v in _grp['_pnl']]
+                    _mkt_texts = []
+                    for v in _grp['_pnl']:
+                        av = abs(v)
+                        sign = '+' if v >= 0 else '-'
+                        _mkt_texts.append(f"{sign}{av/10000:.1f}万" if av >= 10000 else f"{sign}{av:,.0f}")
+                    fig_mkt = go.Figure(go.Bar(
+                        y=_grp.index, x=_grp['_pnl'], orientation='h',
+                        marker_color=bar_colors, text=_mkt_texts, textposition='auto',
+                        textfont=dict(size=12, family='SF Mono, Consolas, monospace'),
+                        insidetextanchor='end', constraintext='both',
+                        hovertemplate='%{y}<br>P&L: ¥%{x:,.0f}<extra></extra>',
+                    ))
+                    fig_mkt.update_layout(
+                        title=dict(text='YTD P&L by Market', font=dict(size=13, color='#8b949e'), x=0.5),
+                        height=max(180, len(_grp) * 38 + 50),
+                        margin=dict(t=35, b=10, l=50, r=20),
+                        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+                        xaxis=dict(showgrid=True, gridcolor='rgba(128,128,128,0.1)',
+                                   zeroline=True, zerolinecolor='rgba(128,128,128,0.3)',
+                                   tickformat=',',
+                                   tickfont=dict(size=11, family='SF Mono, Consolas, monospace')),
+                        yaxis=dict(tickfont=dict(size=12, family='SF Mono, Consolas, monospace')),
+                        showlegend=False, uniformtext=dict(minsize=10, mode='hide'),
+                    )
+                    st.plotly_chart(fig_mkt, use_container_width=True)
+
+                with col_stk:
+                    _pos = _ytd_delta_df[_ytd_delta_df['pnl_delta'] > 0].nlargest(10, 'pnl_delta')
+                    _neg = _ytd_delta_df[_ytd_delta_df['pnl_delta'] < 0].nsmallest(5, 'pnl_delta')
+                    _top = pd.concat([_neg, _pos])
+                    if _top.empty:
+                        st.caption("No stock contributions")
+                    else:
+                        _labels = list(_top['name'])
+                        bar_colors = ['#ef4444' if v >= 0 else '#22c55e' for v in _top['pnl_delta']]
+                        _stk_texts = []
+                        for v in _top['pnl_delta']:
+                            av = abs(v)
+                            sign = '+' if v >= 0 else '-'
+                            _stk_texts.append(f"{sign}{av/10000:.1f}万" if av >= 10000 else f"{sign}{av:,.0f}")
+                        fig_stk = go.Figure(go.Bar(
+                            y=_labels, x=_top['pnl_delta'].tolist(), orientation='h',
+                            marker_color=bar_colors, text=_stk_texts, textposition='auto',
+                            textfont=dict(size=11, family='SF Mono, Consolas, monospace'),
+                            insidetextanchor='end', constraintext='both',
+                            hovertemplate='%{y}<br>P&L: ¥%{x:,.0f}<extra></extra>',
+                        ))
+                        fig_stk.update_layout(
+                            title=dict(text='YTD P&L by Stock', font=dict(size=13, color='#8b949e'), x=0.5),
+                            height=max(200, len(_top) * 28 + 50),
+                            margin=dict(t=35, b=10, l=80, r=20),
+                            paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+                            xaxis=dict(showgrid=True, gridcolor='rgba(128,128,128,0.1)',
+                                       zeroline=True, zerolinecolor='rgba(128,128,128,0.3)',
+                                       tickformat=',',
+                                       tickfont=dict(size=11, family='SF Mono, Consolas, monospace')),
+                            yaxis=dict(tickfont=dict(size=11, family='SF Mono, Consolas, monospace')),
+                            showlegend=False, uniformtext=dict(minsize=10, mode='hide'),
+                        )
+                        st.plotly_chart(fig_stk, use_container_width=True)
+                continue  # Skip generic logic for YTD when using snapshot comparison
 
             _df = df[df[pnl_col].notna()].copy() if pnl_col in df.columns else df.copy()
             if _df.empty and not _merge_realised:
@@ -3177,7 +3388,9 @@ def main():
         </div>''', unsafe_allow_html=True)
 
     render_risk_analytics()
-    render_attribution(df, fx)
+    render_attribution(df, fx,
+                       stock_pnl_now=st.session_state.get('_stock_pnl_dict'),
+                       ytd_base_date=st.session_state.get('_ytd_base_date'))
     render_pnl_journal(df, fx)
     render_closed(fx)
 
